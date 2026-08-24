@@ -64,7 +64,7 @@ typedef struct VCBSim {
 	 * {state, ink, n_inputs, n_high}, so it is a byte here and wraps the same way.
 	 * The state itself lives in model->ent[k].state. */
 	uint8_t   *n_high;    /* [n+1] tally of high inputs (for a net: of high drivers) */
-	uint8_t   *n_in;      /* [n+1] number of input nets (components only) */
+	uint8_t   *n_in;      /* [n+1] circuit_data byte [2]: in-degree (vcb_model_indegree) */
 
 	/* Directed adjacency: for a component, the nets it drives; for a net
 	 * representative, the components that read it. Deduplicated. */

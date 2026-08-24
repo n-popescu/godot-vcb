@@ -622,16 +622,19 @@ int main(void) {
 		int32_t asmv[2] = { 0x00000000, 0x01000000 };
 		int32_t *w = NULL;
 		int32_t n = vcb_vmem_build(live, 8, asmv, 2, &w);
-		CHECK(n == 2 && w && (uint32_t)w[0] == 0x11223344u && (uint32_t)w[1] == 0xABBBCCDDu,
-				"vmem: build = BE32(live) | assembly");
+		// Word 0 is the reserved slot -- the original's image is always 0 there
+		// (measured; see vcb_vmem.c) -- and word 1 up is BE32(live) | assembly.
+		CHECK(n == 2 && w && w[0] == 0 && (uint32_t)w[1] == 0xABBBCCDDu,
+				"vmem: build = BE32(live) | assembly, word 0 reserved");
 		free(w);
 	}
 	{
 		// Missing assembly words are treated as 0 (we tolerate; the binary asserts).
-		uint8_t live[4] = { 0x01, 0x02, 0x03, 0x04 };
+		uint8_t live[8] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
 		int32_t *w = NULL;
-		int32_t n = vcb_vmem_build(live, 4, NULL, 0, &w);
-		CHECK(n == 1 && w && (uint32_t)w[0] == 0x01020304u, "vmem: build tolerates short assembly");
+		int32_t n = vcb_vmem_build(live, 8, NULL, 0, &w);
+		CHECK(n == 2 && w && w[0] == 0 && (uint32_t)w[1] == 0x05060708u,
+				"vmem: build tolerates short assembly");
 		free(w);
 	}
 	{

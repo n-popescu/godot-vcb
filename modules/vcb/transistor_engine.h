@@ -50,6 +50,11 @@ class TransistorEngine : public Reference {
 	// reallocated every frame (see transistor_engine.cpp).
 	PoolVector<uint8_t> state_buf;   // reused staging for the state texture
 	int last_vinput = 0;             // previous virtual-input word (change detection)
+	// The VMem editor's visible window, as solve()'s p_vmem_range packs it:
+	// low 32 bits = first word address, high 32 bits = word count
+	// (vmem_editor.gd::update_range). get_vmem_section() returns exactly that window.
+	int64_t vmem_window_start = 0;
+	int64_t vmem_window_count = 0;
 	PoolVector<int> vd_staging;      // reused vdisplay VMem staging
 	PoolVector<int> vd_pal;          // reused vdisplay palette
 	PoolVector<uint8_t> vd_px;       // reused vdisplay pixel buffer
@@ -71,7 +76,7 @@ public:
 	// into a real-time paused-tick accumulator for the real-time TIMER ink. That
 	// real-time domain is a Phase-B fidelity item, so the value is accepted with
 	// the correct ABI type but not yet consumed here.
-	Variant solve(int p_ticks, const Array &p_override_keys, int p_vinput, int p_vmem_range,
+	Variant solve(int p_ticks, const Array &p_override_keys, int p_vinput, int64_t p_vmem_range,
 			real_t p_time_paused);
 	void compute(const Variant &p_userdata); // background worker (started via Thread.start)
 	void stop();

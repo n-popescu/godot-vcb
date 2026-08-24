@@ -172,17 +172,11 @@ void vcb_sim_init(VCBSim *s, VCBModel *m) {
 			ivec_push_unique(&s->adj[r], g);
 		}
 	}
-	/* n_inputs per component = its deduplicated input-net count (a byte, as in
-	 * the original's circuit_data cell[2]). */
-	for (int32_t g = 1; g <= n; g++) {
-		if (m->ent[g].is_trace)
-			continue;
-		VCBIntVec seenv = { 0, 0, 0 };
-		for (int32_t j = 0; j < m->ent[g].inputs.count; j++)
-			ivec_push_unique(&seenv, rep_of(s, m->ent[g].inputs.items[j]));
-		s->n_in[g] = (uint8_t)seenv.count;
-		free(seenv.items);
-	}
+	/* circuit_data byte [2] per entity: a component's deduplicated input-net count
+	 * (what the gate handlers compare n_high against) and a net's driver count.
+	 * Both are the entity's in-degree; vcb_model_indegree is the one definition,
+	 * shared with the emitted circuit_data and the state texture. */
+	vcb_model_indegree(m, s->n_in);
 
 	/* VMem runtime: a mutable copy of the compiled image plus the latch lists. */
 	if (m->vmem && m->vmem_len > 0) {

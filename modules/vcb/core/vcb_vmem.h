@@ -6,7 +6,8 @@
  * vcb-engine-recovery/docs/vmem_vdisplay.md). Pure, Godot-free, unit-tested.
  *
  * The builder's core data transform is fully recovered: the model's VMem word
- * image is `BE32(live_vmem[4i..4i+4]) | assembly[i]` per word. The surrounding
+ * image is `BE32(live_vmem[4i..4i+4]) | assembly[i]` per word, except word 0, which
+ * the original always leaves 0 (the reserved slot -- see vcb_vmem.c). The surrounding
  * `queues` pass in the binary is Godot error/warning-macro scaffolding around
  * bounds checks (per-queue diagnostics), not additional data writes, so it is not
  * reproduced here. See the doc for the confidence split.
@@ -21,7 +22,8 @@ extern "C" {
 #endif
 
 /* Build the initial VMem word image exactly as builder 0x3e3c70 does:
- *   n = live_len / 4;  words[i] = (b0<<24)|(b1<<16)|(b2<<8)|b3 | assembly[i]
+ *   n = live_len / 4;  words[0] = 0;
+ *   words[i] = (b0<<24)|(b1<<16)|(b2<<8)|b3 | assembly[i]   for i >= 1
  * where b0..b3 = live_vmem[4i..4i+4] (big-endian) and assembly[i] is the program
  * word (0 if `assembly` is shorter than n -- the binary asserts len; we tolerate).
  * Allocates *out_words (caller frees); returns n (>= 0). */

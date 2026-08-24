@@ -21,7 +21,16 @@ int32_t vcb_vmem_build(const uint8_t *live_vmem, int32_t live_len,
 	int32_t *w = (int32_t *)malloc((size_t)n * sizeof(int32_t));
 	if (!w)
 		return 0;
-	for (int32_t i = 0; i < n; i++) {
+	/* Word 0 is the reserved slot: the original's image is always 0 there, dropping
+	 * both the live bytes and the assembly word at index 0 -- measured against the
+	 * original engine (tools/phasec, probe p13 + the vpat/vasm images: live word 0 =
+	 * 0xab with assembly[0] = 0x55 still reads back as 0, while every word from 1 up
+	 * carries live | assembly exactly). Same 1-indexing as the rest of the engine
+	 * (entities, circuit_data, adjacency). Runtime writes to address 0 do land -- it
+	 * is only the compiled image that skips it. */
+	if (n > 0)
+		w[0] = 0;
+	for (int32_t i = 1; i < n; i++) {
 		uint32_t b0 = live_vmem[i * 4 + 0];
 		uint32_t b1 = live_vmem[i * 4 + 1];
 		uint32_t b2 = live_vmem[i * 4 + 2];

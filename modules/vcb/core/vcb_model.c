@@ -156,10 +156,14 @@ int vcb_model_build(TCAnalysisCtx *ctx, VCBModel *out) {
 				 * only by the virtual-input sweep. A READ junction drawn against any of
 				 * them is inert -- verified against the original, where a CLOCK behind a
 				 * READ whose net goes high keeps its interval phase, and a VINPUT behind
-				 * a live READ stays low. They still drive nets through WRITE junctions. */
+				 * a live READ stays low. They still drive nets through WRITE junctions.
+				 * The original does count the connection in the gate's n_conn byte
+				 * though (probe p10), so record it without wiring it up. */
 				if (nink == 0xfe && (out->ent[gate].ink == 0x0b || out->ent[gate].ink == 0x0f ||
-						out->ent[gate].ink == 0x10))
+						out->ent[gate].ink == 0x10)) {
+					ivec_push_unique(&out->ent[gate].inert_inputs, ni);
 					continue;
+				}
 				model_add_edge(out, gate, ni, nink == 0xff /* WRITE -> output */);
 			}
 		}
@@ -261,6 +265,7 @@ void vcb_model_free(VCBModel *m) {
 			ivec_free(&m->ent[i].inputs);
 			ivec_free(&m->ent[i].outputs);
 			ivec_free(&m->ent[i].conns);
+			ivec_free(&m->ent[i].inert_inputs);
 		}
 		free(m->ent);
 	}
@@ -272,16 +277,53 @@ void vcb_model_free(VCBModel *m) {
 	memset(m, 0, sizeof(*m));
 }
 
+/* net_rep, guarding a model built before the merge pass ran. */
+static int32_t model_rep(const VCBModel *m, int32_t k) {
+	return (m->net_rep && k >= 0 && k <= m->n_entities) ? m->net_rep[k] : k;
+}
+
+void vcb_model_indegree(const VCBModel *m, uint8_t *out) {
+	const int32_t n = m->n_entities;
+	memset(out, 0, (size_t)n + 1);
+	VCBIntVec seen = { 0, 0, 0 };
+	for (int32_t g = 1; g <= n; g++) {
+		if (m->ent[g].is_trace)
+			continue;
+		/* the gate's input count: distinct input nets, resolved through the merge */
+		seen.count = 0;
+		for (int32_t j = 0; j < m->ent[g].inputs.count; j++)
+			ivec_push_unique(&seen, model_rep(m, m->ent[g].inputs.items[j]));
+		for (int32_t j = 0; j < m->ent[g].inert_inputs.count; j++)
+			ivec_push_unique(&seen, model_rep(m, m->ent[g].inert_inputs.items[j]));
+		out[g] = (uint8_t)seen.count;
+		/* and one driver for each distinct net it writes, charged to that net */
+		seen.count = 0;
+		for (int32_t j = 0; j < m->ent[g].outputs.count; j++)
+			ivec_push_unique(&seen, model_rep(m, m->ent[g].outputs.items[j]));
+		for (int32_t j = 0; j < seen.count; j++)
+			out[seen.items[j]]++;
+	}
+	ivec_free(&seen);
+	/* every trace in a merged group reports the group's count */
+	for (int32_t k = 1; k <= n; k++)
+		if (m->ent[k].is_trace)
+			out[k] = out[model_rep(m, k)];
+}
+
 void vcb_model_emit_circuit_data(const VCBModel *m, uint8_t **out_data, int32_t *out_len) {
 	int32_t side = m->sidelength > 0 ? m->sidelength : 1;
 	int32_t n = side * side * 4;
 	uint8_t *d = (uint8_t *)calloc((size_t)n, 1);
+	uint8_t *nconn = (uint8_t *)calloc((size_t)m->n_entities + 1, 1);
+	if (nconn)
+		vcb_model_indegree(m, nconn);
 	for (int32_t k = 1; k <= m->n_entities && k < side * side; k++) {
 		d[k * 4 + 0] = m->ent[k].state;
 		d[k * 4 + 1] = m->ent[k].ink;
-		d[k * 4 + 2] = (uint8_t)m->ent[k].conns.count;
+		d[k * 4 + 2] = nconn ? nconn[k] : 0;
 		d[k * 4 + 3] = 0;
 	}
+	free(nconn);
 	*out_data = d;
 	*out_len = n;
 }

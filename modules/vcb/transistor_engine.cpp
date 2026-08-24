@@ -29,6 +29,9 @@ TransistorEngine::~TransistorEngine() {
 	}
 }
 
+static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> reuse,
+		PoolVector<uint8_t> &buf);
+
 void TransistorEngine::set_circuit_model(const Ref<TransistorCircuitModel> &p_model) {
 	model = p_model;
 	if (sim) {
@@ -37,12 +40,17 @@ void TransistorEngine::set_circuit_model(const Ref<TransistorCircuitModel> &p_mo
 		sim = nullptr;
 	}
 	current_tick = current_event = prev_tick = prev_event = 0;
+	state_texture = Ref<ImageTexture>();
 	if (p_model.is_valid() && p_model->native) {
 		sim = (VCBSim *)malloc(sizeof(VCBSim));
 		vcb_sim_init(sim, p_model->native);
 		vcb_sim_set_clock(sim, clock_interval);
 		vcb_sim_set_timer_us(sim, timer_interval_us);
 		vcb_sim_set_seed(sim, (uint32_t)random_seed);
+		// In the original engine get_texture() is already valid here -- the worker
+		// publishes the compiled circuit_data before the first solve() -- so build the
+		// tick-0 texture now instead of leaving it null until something solves.
+		state_texture = te_build_state_texture(sim, state_texture, state_buf);
 	}
 }
 
@@ -79,18 +87,24 @@ void TransistorEngine::set_vdisplay_settings(const Vector2 &p_size, int p_index,
 }
 
 // Rebuild the per-entity state texture: a sidelength x sidelength RGBA8 image
-// whose cell k holds entity k's state. Paired with the compiler's die texture
-// (pixel -> entity coord) and on/off textures, this is what the renderer samples.
+// whose cell k holds entity k's circuit_data. Paired with the compiler's die
+// texture (pixel -> entity coord) and the on/off textures, this is what the
+// renderer samples.
+//
+// The image is a copy of circuit_data, cell k = {state, ink, n_conn, n_high} --
+// verified byte for byte against the original engine's get_texture (0x28fca0) on
+// the probe boards. All four channels are RAW: R is 0 or **1**, not 0/255 (the
+// shader does `is_on = ceil(entity_data.r)`, so 255 renders identically -- which is
+// why writing 255 looked right and still made every lit pixel differ from the
+// original's texture byte for byte), G is the ink (0xff for a net), B is the
+// in-degree, and A is the raw n_high the shader clamps itself
+// (`round(min(entity_data.a * 255.0, 15.0))` for the LED palette index).
 //
 // Perf (v-perf): this runs once per rendered frame, so it must scale with the board,
-// not with wall-clock:
-//   * The staging buffer `buf` is reused across frames (no side*side*4 alloc/free each
-//     frame — that is up to megabytes per frame on large boards).
-//   * `n_high` (the A channel, the LED palette index) is only meaningful for LED cells
-//     (ink 0x0c), and the shader only reads A for LEDs, so we compute it *only* for
-//     LEDs. Previously it summed every entity's input states every frame — an
-//     O(total connections) rescan of the whole graph each frame, which is exactly the
-//     kind of per-frame cost that made big (VMem/VDisplay-heavy) projects lag.
+// not with wall-clock. The staging buffer `buf` is reused across frames (no
+// side*side*4 alloc/free each frame -- that is up to megabytes per frame on large
+// boards), and the fill is one linear pass over the entities: every value it needs
+// is already maintained by the kernel, so there is no per-frame rescan of the graph.
 static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> reuse,
 		PoolVector<uint8_t> &buf) {
 	VCBModel *m = sim->model;
@@ -104,18 +118,14 @@ static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> r
 		memset(p, 0, (size_t)need);
 		for (int32_t k = 1; k <= m->n_entities && k < side * side; k++) {
 			VCBEntity *e = &m->ent[k];
-			// The state texture is a copy of circuit_data {state, ink, _, n_high}. The
-			// shader reads R = on/off, G = raw ink (==12 => LED), and A = the LED palette
-			// index = min(n_high, 15). A is only sampled for LEDs, so only LEDs pay the
-			// input scan.
-			p[k * 4 + 0] = e->state ? 255 : 0; // R = on/off (shader: is_on = ceil(r))
-			p[k * 4 + 1] = e->ink;             // G = raw type (shader: is_led = g*255 == 12)
-			if (e->ink == 0x0c) {              // LED: A = number of high inputs
-				int n_high = 0;
-				for (int32_t j = 0; j < e->inputs.count; j++)
-					n_high += m->ent[e->inputs.items[j]].state ? 1 : 0;
-				p[k * 4 + 3] = (uint8_t)(n_high < 15 ? n_high : 15);
-			}
+			// A bus/mesh-merged net's tallies live on the group's representative (the
+			// original engine merges those nets into a single entity at compile time),
+			// so every trace in the group reports the group's counts.
+			const int32_t r = (e->is_trace && m->net_rep) ? m->net_rep[k] : k;
+			p[k * 4 + 0] = e->state ? 1 : 0; // state, raw 0/1
+			p[k * 4 + 1] = e->ink;           // ink (0xff for a net)
+			p[k * 4 + 2] = sim->n_in[r];     // n_conn (in-degree)
+			p[k * 4 + 3] = sim->n_high[r];   // n_high accumulator, unclamped
 		}
 	}
 	Ref<Image> img;
@@ -134,10 +144,15 @@ static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> r
 	return tex;
 }
 
-Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p_vinput, int,
-		real_t p_time_paused) {
+Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p_vinput,
+		int64_t p_vmem_range, real_t p_time_paused) {
 	prev_tick = current_tick;
 	prev_event = current_event;
+
+	// The VMem editor's visible window, packed as address | (count << 32)
+	// (vmem_editor.gd::update_range); get_vmem_section() reports that slice.
+	vmem_window_start = p_vmem_range & 0xffffffff;
+	vmem_window_count = (p_vmem_range >> 32) & 0xffffffff;
 
 	// The TIMER ink is real-time in the original engine, not tick-based: the kernel
 	// compares wall-clock microseconds since the last fire against the interval,
@@ -226,6 +241,13 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 
 	// TE_RESULT (simulator.gd): [tick, tpf, event, epf, vmem_addr, vmem_ready,
 	// breakpoints, vmem_occ_addr, vmem_occ_content].
+	Array occ_addr, occ_content;
+	if (sim) {
+		for (int32_t i = 0; i < sim->vmem_occ_addr.count; i++)
+			occ_addr.push_back(sim->vmem_occ_addr.items[i]);
+		for (int32_t i = 0; i < sim->vmem_occ_content.count; i++)
+			occ_content.push_back(sim->vmem_occ_content.items[i]);
+	}
 	Array res;
 	res.resize(9);
 	res[0] = current_tick;
@@ -233,10 +255,14 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 	res[2] = current_event;
 	res[3] = current_event - prev_event;
 	res[4] = sim ? sim->vmem_address : 0; // VMEM_ADDRESS (kernel VMem sweep)
-	res[5] = true;  // vmem ready
-	res[6] = breakpoints; // breakpoint positions that fired this frame
-	res[7] = Array(); // vmem occ address (TODO(phase-b): VMem subsystem)
-	res[8] = Array(); // vmem occ content (TODO(phase-b): VMem subsystem)
+	// "ready" is the inverse of the kernel's VMem lock: the tick after an address
+	// change the memory is busy and latch schedules are recorded as occurrences
+	// instead of latching. Verified against the original, which reports ready=false
+	// on exactly the address-change ticks (tools/phasec probe p13).
+	res[5] = sim ? (sim->vmem_lock == 0) : true;
+	res[6] = breakpoints;    // breakpoint positions that fired this frame
+	res[7] = occ_addr;       // VMEM address-latch occurrences (event-log timestamps)
+	res[8] = occ_content;    // VMEM content-latch occurrences
 	return res;
 }
 
@@ -326,24 +352,34 @@ Ref<Texture> TransistorEngine::get_vdisplay_texture() {
 	return tex;
 }
 
-// get_vmem_section (0x28ffd0): the VMem section shown in the VMem editor -- the
-// model's VMem words as a PoolIntArray. get_vmem_persistent (0x2900a0): the
-// big-endian byte repack of a VMem word range (vcb_vmem_persistent). Both read the
-// model's VMem image (built by compute_vmem_data); runtime updates are Phase-B.
+// get_vmem_section (0x28ffd0): the slice of VMem the VMem editor is showing -- the
+// window solve() was last given in p_vmem_range (address | count << 32), NOT the
+// whole image: vmem_editor.gd indexes the returned array from 0 for the line at
+// `address_top`, so returning everything would show the wrong words on any scroll
+// position but the top. get_vmem_persistent (0x2900a0) is the big-endian byte repack
+// of an explicit word range (vcb_vmem_persistent).
 PoolVector<int> TransistorEngine::get_vmem_section() {
 	PoolVector<int> out;
-	// Prefer the simulator's live VMem (runtime writes); fall back to the model's
-	// initial image.
+	// The simulator's live VMem (runtime writes); the model's initial image before
+	// the sim exists.
 	const int32_t *vmem = sim && sim->vmem ? sim->vmem
 			: ((model.is_valid() && model->native) ? model->native->vmem : nullptr);
-	const int n = sim && sim->vmem ? sim->vmem_len
+	const int64_t n = sim && sim->vmem ? sim->vmem_len
 			: ((model.is_valid() && model->native) ? model->native->vmem_len : 0);
-	if (!vmem)
+	if (!vmem || vmem_window_count <= 0)
 		return out;
-	out.resize(n);
+	int64_t start = vmem_window_start < 0 ? 0 : vmem_window_start;
+	int64_t count = vmem_window_count;
+	if (start > n)
+		start = n;
+	if (start + count > n)
+		count = n - start;
+	if (count <= 0)
+		return out;
+	out.resize((int)count);
 	PoolVector<int>::Write w = out.write();
-	for (int i = 0; i < n; i++)
-		w.ptr()[i] = vmem[i];
+	for (int64_t i = 0; i < count; i++)
+		w.ptr()[i] = vmem[start + i];
 	return out;
 }
 PoolVector<uint8_t> TransistorEngine::get_vmem_persistent(int p_start, int p_end) {

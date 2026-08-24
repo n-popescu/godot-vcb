@@ -39,6 +39,12 @@ typedef struct VCBEntity {
 	VCBIntVec inputs;   /* gate: the trace nets it reads */
 	VCBIntVec outputs;  /* gate: the trace nets it drives */
 	VCBIntVec conns;    /* undirected connection list (for circuit_data/adjacency) */
+	/* Nets a READ junction wires to this gate that the kernel must NOT schedule it
+	 * from: CLOCK / VINPUT / TIMER are driven only by the interval scheduler and the
+	 * virtual-input sweep. The original still counts them in the gate's circuit_data
+	 * n_conn byte (measured on probe p10), so they are kept here -- counted, never
+	 * simulated. */
+	VCBIntVec inert_inputs;
 } VCBEntity;
 
 typedef struct VCBModel {
@@ -73,6 +79,18 @@ typedef struct VCBModel {
  * full trace nets in entities_b order). Returns 0 on success, non-zero on OOM. */
 int  vcb_model_build(TCAnalysisCtx *ctx, VCBModel *out);
 void vcb_model_free(VCBModel *m);
+
+/* Fill out (n_entities + 1 bytes) with each entity's `n_conn` -- byte [2] of its
+ * circuit_data cell. Measured against the original engine's live state texture
+ * (tools/phasec, probe p1), that byte is the entity's **in-degree**, not its total
+ * connection count:
+ *   - a component: the number of distinct nets it READs (its input count, which is
+ *     what the gate handlers compare n_high against);
+ *   - a trace net: the number of distinct components that WRITE to it.
+ * Nets are counted per bus/mesh group (the original merges those into one entity at
+ * compile time), and every member of a group reports the group's count. It is a
+ * byte, so it wraps exactly as the original's cell does. */
+void vcb_model_indegree(const VCBModel *m, uint8_t *out);
 
 /* Emit circuit_data (sidelength^2 * 4 bytes; cell k = {state, ink, n_conn, 0},
  * 1-indexed) exactly as construct_model does. Caller frees *out_data. */
