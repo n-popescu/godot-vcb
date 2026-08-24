@@ -1,0 +1,11 @@
+#!/usr/bin/env python
+
+Import("env")
+Import("env_modules")
+
+env_vcb = env_modules.Clone()
+
+# The recovered simulation algorithm is plain C (Godot-free); the .cpp files are
+# the thin Godot ClassDB wrappers around it.
+env_vcb.add_source_files(env.modules_sources, "*.cpp")
+env_vcb.add_source_files(env.modules_sources, "core/*.c")
