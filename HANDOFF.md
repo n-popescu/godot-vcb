@@ -36,11 +36,13 @@ directory surviving again.
 
 | path | what was compared | result |
 |---|---|---|
-| C core (`tools/phasec/vcbtrace`) | 13 probes: every board pixel, event counter, VMem section | **all match** |
-| built Godot module | the same 13 probes through the same harness | **all match** |
+| C core (`tools/phasec/vcbtrace`) | 14 probes: every board pixel, event counter, VMem section | **all match** |
+| built Godot module | the same 14 probes through the same harness | **all match** |
 | built Godot module | 3 real projects, per board pixel, 32 frames each | **`ALL 32 frames identical`** |
 | C core | the same 3 projects (`bigdiff`) | **`ALL 33 solves identical`** |
-| C core | 210 random corpus boards | 192 match; **all 18 failures have ≥2 RANDOM inks** (the one known divergence) |
+| C core | **400 random corpus boards**, one job per process | **369 match**; all 31 failures have ≥2 RANDOM inks (the one known divergence). By RANDOM-ink count: 0 → 28/28, 1 → 49/49, ≥2 → 292/323 |
+| C core | the `n_in` / in-degree change, A/B on all 400 corpus boards | **400/400 byte-identical**, twice (vs `inert_inputs` excluded, and vs the exact pre-change `n_in`) |
+| built Godot module | **a real project genuinely driving VMem** (20 address + 32 content latches): `02_32_bit_computer` both memory variants, `01_..._compact` with zeroed memory | **`ALL 32 frames identical`**, and the VMem telemetry + 1024-word memory image identical |
 | whole game, built binary | opens each sample project, compiles it, simulates, renders | **`SMOKE TEST OK`** |
 
 ### Reproducing all of it
@@ -101,7 +103,21 @@ xvfb-run -a <godot-vcb>/bin/godot.x11.opt.tools.64 --path . \
    looks exactly like a VMem divergence. The harness pads explicitly now.
 7. **A real-time TIMER cannot be compared against `vcbtrace`**, which has no wall
    clock to feed it. Probes p2/p10 use `timer=1000` so it never fires; a firing TIMER
-   is only testable through the built module.
+   is only testable through the built module. **This bites hard on whole projects:**
+   the harness's `settle_ms` makes real time elapse, so a project carrying a TIMER ink
+   (`01_32_bit_computer_compact` has one, `02_32_bit_computer` has none) will fire it on
+   the original and not on the C core. It cost an hour this session and looked exactly
+   like a VMem bug. Set `timer` large enough that it cannot fire (100 s) for anything
+   being compared, unless the TIMER is the thing under test.
+8. **A clocked project does nothing until the clock fires.** `01_..._compact` has
+   `clock_interval` 36, so a 32-tick run leaves the CPU idle and every comparison
+   passes while testing nothing. Run enough ticks for several clock edges (2048 ticks =
+   ~57 edges) before believing a whole-project VMem result.
+9. **Check that the comparison compared something.** Three separate vacuous-pass bugs
+   have now been found in this tooling: a syntax error that killed every probe run, a
+   ground-truth path that made every corpus board `SKIP`, and `MATCH` reported for a
+   board the original refuses to compile. `diff.py` now fails on an empty comparison —
+   keep it that way, and be suspicious of a clean sweep you did not see the counts for.
 
 ## What this session found and fixed
 
@@ -137,14 +153,99 @@ Also fixed, all real API divergences found by the new probes:
 - `get_texture()` returned null until the first `solve()`; in the original it is valid
   as soon as the model is set.
 - A gate's `n_conn` counts a READ junction drawn against a CLOCK / VINPUT / TIMER even
-  though the kernel must not schedule it from one. Recorded (never wired up), so the
-  count matches without touching the verified scheduler.
+  though the kernel must not schedule it from one. Those nets are recorded in
+  `inert_inputs`: they are **deliberately counted in `n_in`** (that is the whole point
+  — it is what makes the byte match the original) but never added to the scheduler's
+  adjacency, so nothing is ever scheduled from them. That is safe only because
+  `vcb_gate_eval` reads `n_inputs` for AND (0x02) and NAND (0x06) alone and neither ink
+  can carry an inert input; both halves of that are now unit-tested, and the whole
+  change is confirmed behaviour-neutral on 400 corpus boards (see below).
 
 Tooling: two VMem probes (p12 write path, p13 read-back with preloaded memory) plus
 the harness support they need (`vmem_bits`, `vmem_dump`, `vmem_start`, `asm_words`),
 `tools/phasec/cmp_small.py` (module vs original on small boards), `tools/smoke_test.gd`
 (the whole game), and three fixes to `diff.py` (a syntax error, and it ignored the
 job's own output path so **every corpus board silently SKIPped**).
+
+## THE OPEN BUG — bus nets through long tunnel runs
+
+`01_32_bit_computer_compact` with a patterned VMem image diverges from the original
+(5/32 frames). **It is not a VMem bug**: the memory image is identical on every dump
+and the interface words (address 1, content `1866972598`) agree across the divergence.
+It is the compiler's **bus grouping**, which `core/vcb_bus.c` has always described as
+"a best-effort model ... pending Phase-C validation".
+
+It is now *measured* rather than assumed. The harness dumps the original's
+`texture_buslut` (`"dump_bus": true` on a big job), which encodes each bus pixel's net
+directly — otherwise invisible, since the die marks every bus pixel with the same
+(65535, 65535) sentinel. On that board:
+
+- the original has **669** bus nets, we have 673;
+- we **split 6** of its nets and **over-merge 2**;
+- that leaves **64 trace nets under-merged**, of which **8** surface as a state
+  divergence (the rest happen to hold equal values);
+- one of our bus "nets" is a **single pixel** (net 427 at (804,1042)), which is the
+  clearest tell.
+
+### What it is not
+
+Probe **p14** pins down nine bus-adjacency rules and every one already agrees with the
+original: orthogonal same-colour merges, diagonal (same *and* different colour) does
+not, a one-cell gap does not, an adjacent TUNNEL pair does, straight through a CROSS
+does, diagonally across a CROSS does not, through a MESH does, and a different trace
+colour on the same bus is a separate channel. So it is not local adjacency, not
+diagonal connectivity, and not the per-colour channel rule.
+
+### What it looks like
+
+The under-merged nets are **≥ 15 px apart** — the link is not local. The board carries
+no MESH or WIRELESS near them (0 mesh-adjacent pixels) but 2004 TUNNEL pixels, and the
+connection is a long tunnel run. Column x=804, scanning up from that single-pixel net:
+
+```
+ y=1042  BUS_3     <- our net 427 (a net of one pixel)
+ y=1041  TUNNEL    <- the entrance
+ y=1040  (empty)
+ y=1039..1036  trace
+ y=1034  TUNNEL  }
+ y=1033  CROSS   }  a "TUNNEL, CROSS, TUNNEL" bridge
+ y=1032  TUNNEL  }
+ y=1030..1018  trace
+ y=1016  TUNNEL / 1015 CROSS / 1014 TUNNEL      (again)
+ y= 998  TUNNEL /  997 CROSS /  996 TUNNEL      (again)
+ y= 980  TUNNEL /  979 CROSS /  978 TUNNEL      (again)
+ y= 971  TUNNEL    <- the partner the original evidently uses
+ y= 970  BUS_3     <- our net 409, which the original merges with 427
+```
+
+Our scan takes the **first** tunnel in the direction (y=1034) and emits the cell just
+past it (y=1033), a CROSS, so the chain dies. Ten tunnels lie between the two bus
+pixels; pairing them greedily from the near end leaves y=971 as the partner, which is
+exactly the one that lands on the bus — but that is one hypothesis (bracket-style
+nesting) and the intervening tunnels are probably serving *horizontal* traffic, which
+would imply a different rule entirely.
+
+**Recursively resolving the tunnel exit (step over a CROSS, tunnel again through a
+TUNNEL) was tried and does NOT fix it** — the under/over-merge counts do not move. That
+attempt was reverted rather than shipped: this function is already a guess, and
+guessing again is what produced the bug. Get the rule from the binary
+(`TC_tunnel_resolve` is the reconstruction of `0x3dff40`) or from probes built on
+tunnel geometry the original *accepts*, then re-measure against `texture_buslut`.
+
+### Reproducing it in about a minute
+
+```bash
+# assembles the board the way editor.gd::get_building_image does, and emits the
+# address/content bit pixel lists for the job's "vmem_bits"
+python3 tools/phasec/original/mkprojboard.py \
+    sample_projects/01_32_bit_computer_compact.vcb board.bin meta.json
+# job: {"board": board.bin, "big": true, "solves": 32, "tps": 64, "clock": 36,
+#       "timer": 100000000, "vmem": <a patterned image>, "vmem_dump": 1024,
+#       "vmem_bits": {"address": ..., "content": ...}, "dump_bus": true}
+# run it through the original and through the built module, then:
+python3 tools/phasec/cmp_shift.py gt/...-pattern.txt mod/...-pattern.txt 1
+#   -> 5/32 frames identical
+```
 
 ## Things proven fine — don't re-litigate
 
@@ -165,19 +266,31 @@ job's own output path so **every corpus board silently SKIPped**).
   entity lists the same way the VMem probes do).
 - **A TIMER that actually fires**, mouse overrides, snapshots (step back/forward),
   long runs, the virtual display, `get_stats()`'s ink-0 bucket.
-- **VMem breadth.** The two directions are now verified on small boards with 1–2
-  address bits and 4 content bits. Not covered: wide address buses, the occurrence /
-  lock path under rapid address changes, `get_vmem_persistent` ranges, a project whose
-  assembly is actually loaded.
+- **VMem is now verified on a real project**, not just probes: 20 address bits and 32
+  content latches, non-empty `compute_vmem_data` queues, 2048 ticks, 10 distinct
+  addresses with reads and writes, memory image and telemetry identical. What is still
+  not covered: a project whose **assembly** is actually assembled and loaded (the
+  sample programs are source text; the runs above preload either zeros or a synthetic
+  pattern), the occurrence / lock path under rapid address changes, and
+  `get_vmem_persistent` ranges.
+- **The VMem latch pixels are painted, not stored.** `editor.gd::get_building_image`
+  overlays them from `vmem_settings` every compile, so a board extracted from
+  `layer_logic` alone has no VMem cells and silently tests nothing. Any future VMem run
+  must assemble the board the same way (bit *i* of the address at
+  `(A_POS_X - i*A_OFFSET_X, A_POS_Y + i*A_OFFSET_Y)`, bit 0 first, and likewise for
+  content) and pass those pixels as `vmem_bits`.
 - **RANDOM ordering.** Boards with 0 or 1 RANDOM ink match. With ≥2, the two engines
   interleave draws from the board's shared MT19937 differently — 18/18 of the corpus
   failures are exactly this. The one known genuine divergence. Use
   `run_isolated.sh` for anything with RANDOM (the original seeds MT once per compute
   thread behind a TLS guard, so Godot thread reuse carries state across jobs).
 
-Rough confidence for an arbitrary user project: **~97% logic-only, ~90% if VMem is
-used, ~95% blended.** What remains is breadth (VINPUT, display, snapshots, wide VMem),
-not a known defect.
+Rough confidence for an arbitrary user project: **~90% logic-only, ~88% if VMem is
+used.** That is *lower* than the previous estimate on purpose — not because anything
+regressed, but because a real project now demonstrates a real defect that no probe and
+no spacious board reaches. VMem went up; buses went down, and buses are common. A
+project that uses buses routed through tunnels can mis-simulate, silently, and the
+symptom is a wrong net rather than a crash.
 
 ## Tooling map
 

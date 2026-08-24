@@ -1318,6 +1318,85 @@ int main(void) {
 		vcb_ctx_free(&c);
 	}
 
+	// --- circuit_data byte [2] (n_conn) is the entity's IN-degree, and counting a
+	// READ junction drawn against a CLOCK / VINPUT / TIMER in it cannot change the
+	// simulation. Those inks are driven only by the interval scheduler / the virtual
+	// input sweep, so the kernel must not schedule them from a net -- but the original
+	// still counts the connection in n_conn (measured; see vcb_model.c). The count is
+	// therefore deliberately inflated for exactly those three inks, which is safe only
+	// because n_in is read by nothing else: vcb_gate_eval consults it for AND (0x02)
+	// and NAND (0x06) alone, and neither can ever carry an inert input. This pins that
+	// invariant down so the two facts can't drift apart. ---
+	{
+		const int s = 16;
+		uint8_t im[16 * 16 * 4];
+		memset(im, 0, sizeof(im));
+		// row 1: NOT -> WRITE -> trace -> READ -> CLOCK   (the inert connection)
+		put(im, 1 * s + 0, rgb_for_ink(0x05));  // NOT
+		put(im, 1 * s + 1, rgb_for_ink(0xff));  // WRITE
+		put(im, 1 * s + 2, rgb_for_ink(0xee));  // trace
+		put(im, 1 * s + 3, rgb_for_ink(0xfe));  // READ
+		put(im, 1 * s + 4, rgb_for_ink(0x0b));  // CLOCK
+		// row 5: NOT -> WRITE -> trace -> READ -> AND     (a real input, for contrast)
+		put(im, 5 * s + 0, rgb_for_ink(0x05));
+		put(im, 5 * s + 1, rgb_for_ink(0xff));
+		put(im, 5 * s + 2, rgb_for_ink(0xee));
+		put(im, 5 * s + 3, rgb_for_ink(0xfe));
+		put(im, 5 * s + 4, rgb_for_ink(0x02));  // AND
+		TCAnalysisCtx c;
+		memset(&c, 0, sizeof(c));
+		c.side = s;
+		vcb_prepare(&c, im, sizeof(im));
+		vcb_scan_pixels(&c);
+		vcb_link(&c);
+		vcb_finalize(&c);
+		VCBModel m;
+		vcb_model_build(&c, &m);
+		int32_t clk = m.lut[1 * s + 4], and_g = m.lut[5 * s + 4];
+		int32_t net1 = m.lut[1 * s + 2], net2 = m.lut[5 * s + 2];
+		uint8_t *nconn = (uint8_t *)calloc((size_t)m.n_entities + 1, 1);
+		vcb_model_indegree(&m, nconn);
+		// The CLOCK counts its READ, but it is NOT an input edge (nothing schedules it
+		// from that net); the AND counts its READ and IS wired to it.
+		int clock_counted = clk > 0 && nconn[clk] == 1 && m.ent[clk].inputs.count == 0 &&
+				m.ent[clk].inert_inputs.count == 1;
+		int and_wired = and_g > 0 && nconn[and_g] == 1 && m.ent[and_g].inputs.count == 1 &&
+				m.ent[and_g].inert_inputs.count == 0;
+		// A net's n_conn is its driver count: one NOT writes each of these two nets.
+		int nets_counted = net1 > 0 && net2 > 0 && nconn[net1] == 1 && nconn[net2] == 1;
+		// And no entity outside {CLOCK, VINPUT, TIMER} can carry an inert input at all,
+		// which is what makes the inflated count unobservable to gate_eval.
+		int only_three_inks = 1;
+		for (int32_t k = 1; k <= m.n_entities; k++)
+			if (m.ent[k].inert_inputs.count > 0 && m.ent[k].ink != 0x0b &&
+					m.ent[k].ink != 0x0f && m.ent[k].ink != 0x10)
+				only_three_inks = 0;
+		free(nconn);
+		CHECK(clock_counted && and_wired && nets_counted && only_three_inks,
+				"model: n_conn is the in-degree; an inert READ counts but never wires up");
+		// Behaviour: the CLOCK keeps its own phase while that net is high -- it is not
+		// scheduled by it, and its inflated n_conn does not reach any gate handler.
+		VCBSim sim;
+		vcb_sim_init(&sim, &m);
+		vcb_sim_set_clock(&sim, 4);
+		vcb_sim_set_seed(&sim, 0);
+		int toggles = 0;
+		uint8_t prev = m.ent[clk].state;
+		for (int t = 0; t < 16; t++) {
+			vcb_sim_tick(&sim);
+			if (m.ent[clk].state != prev) {
+				toggles++;
+				prev = m.ent[clk].state;
+			}
+		}
+		vcb_sim_free(&sim);
+		// 16 ticks at interval 4 -> the CLOCK is scheduled at ticks 0,4,8,12: 4 toggles.
+		CHECK(toggles == 4,
+				"sim: a CLOCK behind a READ keeps its interval phase (inert connection)");
+		vcb_model_free(&m);
+		vcb_ctx_free(&c);
+	}
+
 	printf("\n%d failure(s)\n", bad);
 	return bad;
 }
