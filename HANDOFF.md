@@ -1,206 +1,196 @@
-# HANDOFF — VCB engine recovery, state as of 2026-08-24
+# HANDOFF — VCB engine recovery, state as of 2026-08-24 (session 2)
 
-Written at the end of a session that (a) rebased the engine fork onto Godot 3.5.1,
-(b) built it, and (c) ran a real project through the built binary against the
-original engine. Read this before touching anything.
+Read this before touching anything. It supersedes the previous handoff; the open bug
+it described (the module's `get_texture()` diverging per pixel) is **fixed and
+verified**, and the VMem path is now covered too.
 
 ## The three repos and what they are
 
 | repo | role | branch to use |
 |---|---|---|
-| `n-popescu/vcb-rebuild` | the game (GDScript + assets), a vendored copy of `modules/vcb`, and all the verification tooling | `main`; new work on `claude/ghidra-decompilation-review-09udb4` |
+| `n-popescu/vcb-rebuild` | the game (GDScript + assets), a vendored copy of `modules/vcb`, and all the verification tooling | `main` |
 | `n-popescu/godot-vcb` | Godot 3.5.1-stable + `modules/vcb` compiled in as native ClassDB classes — the engine half, buildable alone | `master` |
-| `vcb-engine-recovery` (local only, `/home/user/vcb-engine-recovery`) | the **original binaries** (`working_exes/vcb.x86_64`, `vcb.exe`) and decompilation notes | — |
+| `vcb-engine-recovery` | the **original binaries** (`working_exes/vcb.x86_64`, `vcb.exe`) and decompilation notes | — |
 
 **You need all three.** `vcb-engine-recovery` is the oracle — without
 `working_exes/vcb.x86_64` you cannot generate ground truth and cannot verify
-anything. It is not on GitHub in this setup; it lives in the container image at
-`/home/user/vcb-engine-recovery`.
+anything.
 
 `modules/vcb/` is vendored in BOTH `vcb-rebuild` and `godot-vcb` and the two copies
-are currently byte-identical. **Any change to one must be mirrored to the other**
-or they drift. Verify with:
+must stay byte-identical. **Any change to one must be mirrored to the other.**
+Verify with:
 
 ```bash
-diff -rq /home/user/vcb-rebuild/modules/vcb /home/user/godot-vcb/modules/vcb \
+diff -rq <vcb-rebuild>/modules/vcb <godot-vcb>/modules/vcb \
   | grep -v '__pycache__\|\.o$\|core_test$\|fuzz_sim$'
 ```
 
-## Verification status — READ THIS FIRST
+## Verification status
 
-The RISC-V CPU project (2048×2048, 219,986 painted pixels, 21,512 entities)
-matches the original engine **exactly**: all 33 solves, every board pixel's state
-and the event counter. Confirmed twice this session — once through the standalone C
-core (`tools/phasec/vcbtrace`) and once through the **built Godot module**.
+Everything below was re-established from scratch this session against
+`working_exes/vcb.x86_64` driven headlessly, because the previous session's scratch
+directory (`/home/user/work/`: the RISC-V board and its ground truth) does not exist
+outside that container. **Ground truth is now reproducible from what is in the repos**
+— the boards come from `sample_projects/*.vcb`, so this does not depend on a scratch
+directory surviving again.
 
-### The clock-interval trap (cost this session hours — do not repeat it)
+| path | what was compared | result |
+|---|---|---|
+| C core (`tools/phasec/vcbtrace`) | 13 probes: every board pixel, event counter, VMem section | **all match** |
+| built Godot module | the same 13 probes through the same harness | **all match** |
+| built Godot module | 3 real projects, per board pixel, 32 frames each | **`ALL 32 frames identical`** |
+| C core | the same 3 projects (`bigdiff`) | **`ALL 33 solves identical`** |
+| C core | 210 random corpus boards | 192 match; **all 18 failures have ≥2 RANDOM inks** (the one known divergence) |
+| whole game, built binary | opens each sample project, compiles it, simulates, renders | **`SMOKE TEST OK`** |
 
-`/home/user/work/gt/riscv.txt` was recorded with a **clock interval of 32 or more**,
-not 1. Running our side at `--clock=1` makes the board's single CLOCK pixel
-(at 831,932) oscillate when the reference run's did not, which shows up as ~7
-differing pixels and a steady **+10 events/tick**. That is a parameter mismatch,
-not an engine bug.
+### Reproducing all of it
 
 ```bash
-# correct:
-./tools/phasec/vcbtrace /home/user/work/boards/riscv.bin --solves=32 --tps=1 \
-    --clock=32 --timer=1000 --seed=0 --big=1 --out=/tmp/f_riscv
-cp /tmp/f_riscv.txt /tmp/f_riscv.txt.txt      # bigdiff expects <prefix>.txt
-python3 tools/phasec/original/bigdiff.py /home/user/work/gt/riscv.txt /tmp/f_riscv
-# => ALL 33 solves identical: every board pixel's state and the event counter
+# 1. the algorithm alone, no Godot (CI-able)
+make -C modules/vcb/core/test
+
+# 2. probes: the original engine vs the C core, per pixel + per event + VMem
+cd tools/phasec/original
+VCB_WORK=/tmp/vcb-probes VCB_EXE=<recovery>/working_exes/vcb.x86_64 ./run.sh probes
+#   -> 13 boards, "0 board(s) differ"
+
+# 3. the same probes through the BUILT module, vs the same ground truth
+cd <godot-vcb> && xvfb-run -a ./bin/godot.x11.opt.tools.64 \
+    --main-pack /tmp/vcb-probes/harness.pck --jobs=<jobs with out= redirected>
+python3 tools/phasec/cmp_small.py /tmp/vcb-probes/gt/p12.txt /tmp/vcb-probes/mod/p12.txt
+
+# 4. whole projects. Boards come straight from the sample projects: the logic layer
+#    of a .vcb is base64(zstd(2048x2048 RGBA8)) with the decompressed size in the
+#    trailing 8 bytes (var2bytes) -- see tools/phasec/README.md.
+#    Run both engines with the same harness pack and compare per board pixel:
+python3 tools/phasec/cmp_shift.py /tmp/work/gt/computer32.txt /tmp/work/mod/computer32.txt 1
+#   -> "ALL 32 frames identical ... every board pixel"
+
+# 5. the whole game, through its own pipeline
+xvfb-run -a <godot-vcb>/bin/godot.x11.opt.tools.64 --path . \
+    -s res://tools/smoke_test.gd --report=/tmp/smoke.txt
 ```
 
-Before concluding "the engine diverges", **always re-run at clock=32 and confirm
-the reference parameters**. `clock=16` fails, `clock=32` and `clock=64` both pass
-(the clock simply never fires inside 33 ticks).
+## Traps that will cost you hours (all of them cost this session or the last one)
 
-### Things this session PROVED are fine (don't re-litigate)
+1. **The original's `solve()` is asynchronous and `get_texture()` publishes the
+   worker's PREVIOUS frame.** With the worker keeping up, the texture read after
+   solve number `i+1` is the state at tick `i`. That is the `shift` argument in the
+   comparators — not a bug on either side. `get_vmem_section()` has the same
+   one-frame lag; `get_vmem_persistent()` and the counters do not.
+2. **The worker only keeps up if you let it.** On a whole project (thousands of
+   events per tick) or on a loaded machine, 32 back-to-back solves leave it thousands
+   of ticks behind: the trace reports `tick=0` throughout and every dumped texture is
+   the same frame, so a frame-indexed comparison silently compares garbage. The
+   harness now sleeps `settle_ms` (default 5) after each solve and prints a `FINAL`
+   line with the settled counters — **check that `FINAL tick` equals the ticks you
+   asked for.** Building Godot with `-j$(nproc)` in the background is enough to break
+   this.
+3. **Do not poll with `solve(0)` to wait for the worker.** `solve()` *overwrites* the
+   tick budget rather than adding to it, so a `solve(0)` cancels the pending ticks and
+   the worker never advances — the harness deadlocks.
+4. **The original engine is not bit-deterministic run to run at the frame level.**
+   Two runs of probe p9 differ at frame 15 (proven by running it twice). It is the
+   same publication race. A single differing frame is not automatically your bug —
+   re-run before believing it.
+5. **Clock interval.** A board's single CLOCK pixel oscillating when the reference's
+   did not is a parameter mismatch, not an engine bug. Always confirm the reference's
+   `clock`.
+6. **`PoolByteArray.resize()` does not zero the new bytes.** A VMem image padded that
+   way carries heap garbage past the file, which differs between two engine builds and
+   looks exactly like a VMem divergence. The harness pads explicitly now.
+7. **A real-time TIMER cannot be compared against `vcbtrace`**, which has no wall
+   clock to feed it. Probes p2/p10 use `timer=1000` so it never fires; a firing TIMER
+   is only testable through the built module.
 
-- The tick kernel `modules/vcb/core/vcb_sim.c` — unchanged and correct.
-- The bus-through-TUNNEL rule (commit `672f7c8`) is **correct and necessary**.
-  With it the partition matches the original exactly (0 over-merge, 0 under-merge);
-  without it 6 groups under-merge (the 195 pixels that commit mentions).
-- The `vcb_bus_label()` refactor in that commit is behaviour-neutral (verified by
-  disabling only the tunnel branch and reproducing the pre-refactor numbers exactly).
-- `n_high` being a `uint8_t` that wraps is correct — widening it to `int32_t`
-  changes nothing on the RISC-V board (no wrap occurs).
-- CLOCK semantics in isolation: probes `clk1`/`clk2` match the original exactly.
+## What this session found and fixed
 
-## What changed this session
+**The state texture is a straight copy of the engine's `circuit_data` cell,
+`{state, ink, n_conn, n_high}`** (confirmed by dumping the original's own texture
+bytes, not by inference). Three of the four channels were wrong:
 
-1. **`godot-vcb` rebased onto Godot 3.5.1-stable** (upstream tag `3.5.1-stable`,
-   commit `6fed1ffa`) with `modules/vcb` added. Pushed as `86bd5f79`. The binary
-   reports `3.5.1.stable.custom_build`, matching the shipped `vcb.exe`. The old
-   `master` (a pure upstream mirror, zero of the owner's commits) is preserved on
-   the branch `pre-vcb-upstream-master`.
-2. **Bug found and fixed by the end-to-end test: missing `DEFVAL`.**
-   `TransistorCompiler::compute` and `TransistorEngine::compute` were bound with a
-   mandatory `userdata` argument. `Thread.start()` always passes one, but the game
-   (`src/main/compiler.gd:114`) and the harness also call `compute()` bare, which
-   was a hard script error. The original binds them with a default. Fixed in both
-   repos.
+- `R` — raw state, **0 or 1**. We wrote `255`. The shader is `is_on = ceil(r)`, so 255
+  renders identically; that is exactly why this looked right and still made every lit
+  pixel differ. **This was the whole open bug.**
+- `B` — `n_conn` = the entity's **in-degree**: a gate's input-net count, a net's driver
+  count. We wrote 0. `vcb_model_indegree` is now the single definition, shared by the
+  texture, the emitted `circuit_data` (which had used the undirected `conns.count`) and
+  the kernel's `n_in`.
+- `A` — raw `n_high`. We clamped to 15 and only for LEDs; the shader does that clamp
+  itself (`round(min(a * 255.0, 15.0))`).
 
-## Known wrapper-vs-original differences (NOT yet resolved)
+Also fixed, all real API divergences found by the new probes:
 
-Found by running the harness against our built binary. None affect simulation
-results, but they are real API divergences:
+- `get_vmem_section()` ignored `solve()`'s `vmem_range` and returned the whole image.
+  It is the VMem editor's visible window, packed `address | count << 32`
+  (`vmem_editor.gd`), and the editor indexes the result from 0 — so the editor showed
+  the wrong words at any scroll position but the top.
+- **The compiled VMem image's word 0 is a reserved slot**: the original always leaves
+  it 0, dropping both the live bytes *and* the assembly word there. Measured three
+  ways (live word 0 = `0xab` with `assembly[0] = 0x55` still reads back 0, while every
+  word from 1 up carries `live | assembly` exactly). Runtime writes to address 0 *do*
+  land — it is only the compiled image that skips it.
+- `vmem_ready` was hardcoded true; it is the inverse of the kernel's VMem lock, false
+  on exactly the address-change ticks.
+- The VMem occurrence lists (`result[7]`/`[8]`) were stubbed empty although the kernel
+  collects them.
+- `get_texture()` returned null until the first `solve()`; in the original it is valid
+  as soon as the model is set.
+- A gate's `n_conn` counts a READ junction drawn against a CLOCK / VINPUT / TIMER even
+  though the kernel must not schedule it from one. Recorded (never wired up), so the
+  count matches without touching the verified scheduler.
 
-1. **`solve()` phase.** The original's `solve()` is asynchronous and returns the
-   tick/event counters from *before* the call; ours runs synchronously and returns
-   post-tick. So our trace is the original's shifted by one: `ours[t] == gt[t+1]`.
-   Confirmed exactly on all 32 comparable solves.
-2. **`get_texture()` returns null before the first `solve()`.** In the original it
-   is already valid after `set_circuit_model`. This breaks any harness that dumps
-   state before solving.
-3. **The die texture carries unresolved entity ids.** Ours reports 24,875 entities
-   where the original reports 21,513, because the original folds bus/mesh-linked
-   nets into one entity at compile time while we keep them separate and tie their
-   states via `net_rep`. **States are consistent** (verified: zero gt-entities whose
-   pixels disagree on our side, at ticks 0/5/15/31), so this is benign for
-   simulation — but anything keyed on entity *index* (`set_vinput_entities_indexes`,
-   VMem entity lists, snapshots) will not line up with the original.
-4. **`get_stats()` omits the ink-0 (blank pixel) bucket** that the original reports.
+Tooling: two VMem probes (p12 write path, p13 read-back with preloaded memory) plus
+the harness support they need (`vmem_bits`, `vmem_dump`, `vmem_start`, `asm_words`),
+`tools/phasec/cmp_small.py` (module vs original on small boards), `tools/smoke_test.gd`
+(the whole game), and three fixes to `diff.py` (a syntax error, and it ignored the
+job's own output path so **every corpus board silently SKIPped**).
+
+## Things proven fine — don't re-litigate
+
+- The tick kernel `modules/vcb/core/vcb_sim.c` — the event-driven two-list update, the
+  gate handlers, CLOCK, the VMem write/read-back order and the VMem lock.
+- The bus-through-TUNNEL rule and the `vcb_bus_label()` refactor.
+- `n_high` being a `uint8_t` that wraps.
+- The die texture's encoding: `r+g*256 = idx % sidelength`, `b+a*256 = idx / sidelength`
+  — exactly what `compiler.gd::get_entity_id` decodes, and byte-identical to the
+  original's on a project where neither side merges nets.
+- The partition difference (we keep bus/mesh-linked nets separate and tie their states
+  through `net_rep`; the original folds them at compile time) is benign for state:
+  every board pixel agrees. It is **not** benign for anything keyed on entity *index*.
 
 ## Still unverified (the honest confidence ladder)
 
-- **VMem read/write path** — the RISC-V run had memory disconnected on *both* sides
-  (empty queues), so the VMem kernel is essentially untested. This is the single
-  biggest confidence item.
-- VINPUT; a TIMER that actually fires; mouse overrides; snapshots; long runs.
-- **RANDOM ordering.** Boards with 0 or 1 RANDOM ink match 77/77. With ≥2 RANDOM
-  inks, 289/323 match — the two engines interleave draws from the board's shared
-  MT19937 differently. Documented in `modules/vcb/core/vcb_sim.h`. This is the one
-  known genuine divergence.
+- **VINPUT** — no probe drives it yet (the plumbing is there: the harness can pass
+  entity lists the same way the VMem probes do).
+- **A TIMER that actually fires**, mouse overrides, snapshots (step back/forward),
+  long runs, the virtual display, `get_stats()`'s ink-0 bucket.
+- **VMem breadth.** The two directions are now verified on small boards with 1–2
+  address bits and 4 content bits. Not covered: wide address buses, the occurrence /
+  lock path under rapid address changes, `get_vmem_persistent` ranges, a project whose
+  assembly is actually loaded.
+- **RANDOM ordering.** Boards with 0 or 1 RANDOM ink match. With ≥2, the two engines
+  interleave draws from the board's shared MT19937 differently — 18/18 of the corpus
+  failures are exactly this. The one known genuine divergence. Use
+  `run_isolated.sh` for anything with RANDOM (the original seeds MT once per compute
+  thread behind a TLS guard, so Godot thread reuse carries state across jobs).
 
-Rough confidence for an arbitrary user project: **~97% logic-only, ~60% if VMem is
-used, ~80% blended.** Closing the VMem gap is what moves this to ~95%.
-
-## Immediate next step (where I stopped) — THE OPEN BUG
-
-**The C core is verified exact. The Godot module is NOT yet.** Be precise about
-the difference, because the two verify differently:
-
-| path | event counters | per-pixel state |
-|---|---|---|
-| C core (`tools/phasec/vcbtrace`) at `clock=32` | exact, all 33 solves | **exact, all 33 solves** |
-| built Godot module at `clock=32` | **exact, all 33 solves** | **DIVERGES** |
-
-So the simulation inside the module is right — its event counters reproduce the
-original's sequence exactly (offset by one solve, see "solve() phase" below) — but
-the **state texture the module exposes through `get_texture()` does not match**.
-
-What was ruled out:
-
-- Not a frame-alignment problem. Tried shift 0, 1 and 2; all fail, with tens of
-  thousands of differing pixels at every alignment. (`gt[0] == gt[1]`, i.e. the
-  original's first two dumps are identical, which is what suggested a lag.)
-- Not a partition problem. Same 134,392 entity-mapped pixels on both sides, zero
-  only-orig / only-ours, and **zero** original-entities whose pixels disagree on our
-  side — so `net_rep` is correctly mirroring group state via `members[]`.
-- Not the clock interval (this run was at the correct `clock=32`).
-- Not the simulation, per the event counters and the C core's per-pixel match.
-
-That leaves the texture build path. Start here:
-
-- `modules/vcb/transistor_engine.cpp:94` `te_build_state_texture()` — builds the
-  sidelength×sidelength RGBA8 image, cell k = entity k, R channel = state. Compare
-  what it writes against `dump_states()` in `tools/phasec/vcbtrace.c:27`, which IS
-  per-pixel exact. The two should be writing the same bytes; find where they differ.
-- `modules/vcb/transistor_engine.cpp:165` `board_changed` gating — it is set true
-  whenever `p_ticks > 0`, so staleness looks unlikely, but confirm the rebuild
-  actually happens on the run path the harness takes.
-- Also check the compiler's **die** texture encoding (`get_textures()[2]`) against
-  the original's: the harness decodes `eid = (b8 + a8*256) * side + (r8 + g8*256)`.
-  A layout mismatch there would misindex every lookup while staying internally
-  consistent — which is exactly the symptom.
-
-Reproduce in ~12 minutes:
-
-```bash
-S=/tmp/scratch; mkdir -p $S
-cd /home/user/vcb-rebuild/tools/phasec/original && python3 mkpck.py pack $S/harness.pck
-cat > $S/jobs.json <<JSON
-[{"name":"riscv","board":"/home/user/work/boards/riscv.bin","out":"$S/m32.txt",
-  "solves":32,"tps":1,"clock":32,"timer":1000,"seed":0,"big":true,
-  "vmem":"/home/user/work/riscv_vmem.bin"}]
-JSON
-cd /home/user/godot-vcb && xvfb-run -a ./bin/godot.x11.opt.tools.64 \
-    --main-pack $S/harness.pck --jobs=$S/jobs.json
-python3 /home/user/vcb-rebuild/tools/phasec/cmp_shift.py \
-    /home/user/work/gt/riscv.txt $S/m32 1
-```
-
-Goal: `ALL 32 frames identical`. Until that passes, the shipped build is **not**
-proven byte-exact even though the kernel is — say so plainly rather than quoting the
-C core's result as if it covered the binary.
-
-Once it does pass, the next target is the VMem path (see "Still unverified").
+Rough confidence for an arbitrary user project: **~97% logic-only, ~90% if VMem is
+used, ~95% blended.** What remains is breadth (VINPUT, display, snapshots, wide VMem),
+not a known defect.
 
 ## Tooling map
 
-- `tools/phasec/vcbtrace.c` — our side, standalone C, no engine build needed.
-- `tools/phasec/original/` — the ground-truth side: `mkpck.py` builds a GDPC v1
-  pack that `--main-pack` loads into the ORIGINAL binary, replacing its game while
-  keeping its ClassDB classes. `pack/harness.gd` is the driver.
-- `tools/phasec/original/bigdiff.py` — whole-project per-pixel comparator.
-- `tools/phasec/cmp_shift.py` — same, but for two runs in the *harness* format with
-  a frame shift (use for module-vs-original).
-- `tools/phasec/original/run.sh` / `run_isolated.sh` — probe and corpus sweeps.
-  **Use `run_isolated.sh` for anything with RANDOM**: the original seeds MT once per
-  compute thread behind a TLS guard, so Godot thread reuse carries state across jobs
-  and only one-job-per-process is reproducible.
-- `/home/user/work/` — scratch from the recovery sessions: `boards/riscv.bin`,
-  `riscv_vmem.bin`, `gt/riscv.txt{,.die,.states}` (ground truth).
-
-## Chores not done
-
-- **Stale branch deletion is blocked.** `git push --delete` returns HTTP 403 through
-  this container's proxy and the GitHub MCP server exposes no delete-ref tool. The
-  owner must run this themselves:
-
-```bash
-git push origin --delete claude/binary-comparison-guide claude/core-override-test \
-  claude/docs-counts claude/gdnative-current claude/godot-4.7-port \
-  claude/modding-docs claude/modding-support claude/vcb-launcher-delivery \
-  claude/vcb-launcher-standalone claude/verify-recovery
-```
+- `tools/phasec/vcbtrace.c` — our side, standalone C, no engine build needed. Now also
+  takes `--vmemaddr` / `--vmemcontent` / `--vmemdump` and always builds the VMem image.
+- `tools/phasec/original/` — the ground-truth side: `mkpck.py` builds a GDPC v1 pack
+  that `--main-pack` loads into the ORIGINAL binary, replacing its game while keeping
+  its ClassDB classes. `pack/harness.gd` is the driver — and the same pack drives our
+  built binary, which is what makes the two directly comparable.
+- `tools/phasec/original/bigdiff.py` — whole project, original vs `vcbtrace`.
+- `tools/phasec/cmp_shift.py` — whole project, original vs our built module.
+- `tools/phasec/cmp_small.py` — small board, original vs our built module (per pixel,
+  event counter and VMem section).
+- `tools/phasec/original/diff.py` — the probe/corpus sweep comparator.
+- `tools/smoke_test.gd` — boots the real game with a build, opens a sample project,
+  compiles and simulates it. The "is this build usable" check.
