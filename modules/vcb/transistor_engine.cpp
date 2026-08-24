@@ -426,7 +426,9 @@ void TransistorEngine::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("solve", "ticks", "override_keys", "vinput", "vmem_range", "time_paused"),
 			&TransistorEngine::solve);
-	ClassDB::bind_method(D_METHOD("compute", "userdata"), &TransistorEngine::compute);
+	// Same as TransistorCompiler::compute -- callable bare or via Thread.start().
+	ClassDB::bind_method(D_METHOD("compute", "userdata"), &TransistorEngine::compute,
+			DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("stop"), &TransistorEngine::stop);
 	ClassDB::bind_method(D_METHOD("get_texture"), &TransistorEngine::get_texture);
 	ClassDB::bind_method(D_METHOD("get_vdisplay_texture"), &TransistorEngine::get_vdisplay_texture);

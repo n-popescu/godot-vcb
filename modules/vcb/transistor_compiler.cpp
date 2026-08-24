@@ -458,7 +458,11 @@ void TransistorCompiler::set_vinput_entities_indexes(const Array &p_indexes) {
 
 void TransistorCompiler::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("setup", "image"), &TransistorCompiler::setup);
-	ClassDB::bind_method(D_METHOD("compute", "userdata"), &TransistorCompiler::compute);
+	// Thread.start() always passes a userdata argument, but the game and the
+	// tooling also call compute() bare; the original binds it with a default so
+	// both arities work. Without DEFVAL a direct compute() is a script error.
+	ClassDB::bind_method(D_METHOD("compute", "userdata"), &TransistorCompiler::compute,
+			DEFVAL(Variant()));
 	ClassDB::bind_method(D_METHOD("get_progress"), &TransistorCompiler::get_progress);
 	ClassDB::bind_method(D_METHOD("get_entitylist_sidelength"),
 			&TransistorCompiler::get_entitylist_sidelength);
