@@ -248,6 +248,92 @@ int main(void) {
 		vcb_ctx_free(&c);
 	}
 
+	// --- the tunnel EXIT-MATCHING rule (probes p15/p16). The resolver used to take
+	// the first tunnel it met in the direction; the original takes the first one whose
+	// far cell carries the SAME INK as the source pixel. Taking the first tunnel split
+	// 64 trace nets on a real project, where a bus run tunnels past ten tunnel pairs
+	// belonging to other wires. ---
+	{
+		const int s = 24;
+		static uint8_t im[24 * 24 * 4];
+		uint32_t tr = rgb_for_ink(0xee), tu = rgb_for_ink(0x65), xs = rgb_for_ink(0x64);
+
+		// (a) tunnel pairs serving OTHER wires (T, CROSS, T) lie between the two ends;
+		//     the walk must pass them and land on the same-ink cell at the far end.
+		memset(im, 0, sizeof(im));
+		put(im, 1 * s + 1, tr);                      // source (1,1)
+		put(im, 1 * s + 2, tu);                      // entrance
+		put(im, 1 * s + 4, tu); put(im, 1 * s + 5, xs); put(im, 1 * s + 6, tu);
+		put(im, 1 * s + 8, tu); put(im, 1 * s + 9, xs); put(im, 1 * s + 10, tu);
+		put(im, 1 * s + 12, tu);                     // the matching exit
+		put(im, 1 * s + 13, tr);                     // target (13,1)
+		TCAnalysisCtx c;
+		memset(&c, 0, sizeof(c));
+		c.side = s;
+		vcb_prepare(&c, im, sizeof(im));
+		vcb_scan_pixels(&c);
+		vcb_link(&c);
+		vcb_finalize(&c);
+		CHECK(c.errors.begin == c.errors.end && c.entity_count_b == 1,
+				"tunnel: the walk passes other wires' tunnel pairs to the matching exit");
+		vcb_ctx_free(&c);
+
+		// (b) exact ink: a trace does NOT tunnel to a trace of a different colour --
+		//     both ends report UNMATCHED instead.
+		memset(im, 0, sizeof(im));
+		put(im, 1 * s + 1, tr);
+		put(im, 1 * s + 2, tu);
+		put(im, 1 * s + 4, tu);
+		put(im, 1 * s + 5, rgb_for_ink(0xf0));       // TRACE_RED, a different ink
+		memset(&c, 0, sizeof(c));
+		c.side = s;
+		vcb_prepare(&c, im, sizeof(im));
+		vcb_scan_pixels(&c);
+		int n_err = 0, codes_ok = 1;
+		for (TCPixel *e = (TCPixel *)c.errors.begin; e != (TCPixel *)c.errors.end; e++) {
+			n_err++;
+			if (e->ink != 1 && e->ink != 2)
+				codes_ok = 0;
+		}
+		CHECK(n_err == 2 && codes_ok,
+				"tunnel: different inks do not pair -- UNMATCHED from both ends");
+		vcb_ctx_free(&c);
+
+		// (c) UNEXPECTED_TUNNEL_ENTRANCE (code 0): walking left from (9,1), the tunnel
+		//     at (5,1) carries the source ink on its NEAR side, so the walk gives up --
+		//     code 0 at that tunnel plus UNMATCHED_TUNNEL_LEFT at the source.
+		memset(im, 0, sizeof(im));
+		put(im, 1 * s + 1, tr); put(im, 1 * s + 2, tu);
+		put(im, 1 * s + 5, tu); put(im, 1 * s + 6, tr);
+		put(im, 1 * s + 8, tu); put(im, 1 * s + 9, tr);
+		memset(&c, 0, sizeof(c));
+		c.side = s;
+		vcb_prepare(&c, im, sizeof(im));
+		vcb_scan_pixels(&c);
+		int have0 = 0, have1 = 0;
+		for (TCPixel *e = (TCPixel *)c.errors.begin; e != (TCPixel *)c.errors.end; e++) {
+			if (e->ink == 0 && e->x == 5 && e->y == 1)
+				have0 = 1;
+			if (e->ink == 1 && e->x == 9 && e->y == 1)
+				have1 = 1;
+		}
+		CHECK(have0 && have1,
+				"tunnel: a same-ink entrance en route -> UNEXPECTED_TUNNEL_ENTRANCE at it");
+		vcb_ctx_free(&c);
+
+		// (d) a lone TUNNEL pixel between two same-ink traces is NOT a pair: the walk
+		//     starts two cells out, so neither side ever sees the other.
+		memset(im, 0, sizeof(im));
+		put(im, 1 * s + 1, tr); put(im, 1 * s + 2, tu); put(im, 1 * s + 3, tr);
+		memset(&c, 0, sizeof(c));
+		c.side = s;
+		vcb_prepare(&c, im, sizeof(im));
+		vcb_scan_pixels(&c);
+		CHECK(c.errors.begin != c.errors.end,
+				"tunnel: a lone TUNNEL pixel is unmatched, not a pair");
+		vcb_ctx_free(&c);
+	}
+
 	// --- bus connection: a trace adjacent to a bus records exactly one edge. ---
 	{
 		const int s = 8;

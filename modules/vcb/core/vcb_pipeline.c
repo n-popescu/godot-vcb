@@ -44,31 +44,48 @@ static void TC_record_bus_connection(TCAnalysisCtx *ctx, const TCPixel *from, co
 }
 
 /* Tunnel resolver (0x3dff40). From the tunnel entrance at `from + DIR[dir]`, walk
- * on in the same direction to the matching exit tunnel (the paired 0x65 pixel -- a
- * tunnel passes *under* whatever wires lie between the pair) and emit the pixel
- * just past the exit as the neighbour. If the board edge is reached with no exit,
- * emit an UNMATCHED_TUNNEL_<dir> error (code = dir + 1). The finer
- * UNEXPECTED_TUNNEL_ENTRANCE (code 0) diagnostic is a Phase-C refinement. */
+ * on in the same direction looking for the *matching* exit tunnel. A tunnel pixel
+ * on the way is only the match if the cell just past it carries the SAME INK as
+ * `from` -- that is what "matching-ink exit tunnel" means, and it is why a tunnel
+ * run can pass under an arbitrary number of other tunnel pairs serving other
+ * wires. Everything else is walked over. Two failure modes:
+ *
+ *   - a tunnel whose *near* side carries `from`'s ink is another wire's entrance
+ *     pointing the same way: UNEXPECTED_TUNNEL_ENTRANCE (code 0) at that tunnel,
+ *     and the walk gives up (so the UNMATCHED error below is emitted as well);
+ *   - the board edge: UNMATCHED_TUNNEL_<dir> (code = dir + 1) at `from`.
+ *
+ * Every clause here is measured against the original (probes p15/p16): exact ink
+ * equality (TRACE_GRAY does not tunnel to TRACE_RED, BUS_0 does not tunnel to
+ * BUS_1), the walk starting two cells out (a lone TUNNEL pixel between two
+ * same-ink wires is UNMATCHED both ways), first match wins, and the error
+ * coordinates -- codes 1..4 at `from`, code 0 at the offending tunnel. */
 static void TC_tunnel_resolve(TCAnalysisCtx *ctx, TCVec *out, const TCPixel *from, int dir) {
 	const int32_t side = ctx->side;
 	const uint8_t *buf = (const uint8_t *)ctx->classified.begin;
 	const int dx = TC_DIR_X[dir], dy = TC_DIR_Y[dir];
+	const uint8_t want = TC_CLASSIFIED_INK(buf, (size_t)from->y * side + from->x);
 	int32_t x = from->x + 2 * dx, y = from->y + 2 * dy; /* first cell past the entrance */
 	while (x >= 0 && x < side && y >= 0 && y < side) {
-		uint8_t ink = TC_CLASSIFIED_INK(buf, (size_t)y * side + x);
-		if (ink == 0x65) { /* exit tunnel: emit the pixel just past it */
+		if (TC_CLASSIFIED_INK(buf, (size_t)y * side + x) == 0x65) {
 			int32_t ex = x + dx, ey = y + dy;
-			if (ex >= 0 && ex < side && ey >= 0 && ey < side) {
-				uint8_t eink = TC_CLASSIFIED_INK(buf, (size_t)ey * side + ex);
-				TCPixel n = { ex, ey, eink };
+			if (ex >= 0 && ex < side && ey >= 0 && ey < side &&
+					TC_CLASSIFIED_INK(buf, (size_t)ey * side + ex) == want) {
+				TCPixel n = { ex, ey, want };
 				TCVecPix_push(out, &n);
+				return;
 			}
-			return;
+			int32_t bx = x - dx, by = y - dy;
+			if (bx >= 0 && bx < side && by >= 0 && by < side &&
+					TC_CLASSIFIED_INK(buf, (size_t)by * side + bx) == want) {
+				TC_emit_error(ctx, x, y, 0); /* UNEXPECTED_TUNNEL_ENTRANCE */
+				break;
+			}
 		}
 		x += dx;
 		y += dy;
 	}
-	TC_emit_error(ctx, from->x + dx, from->y + dy, dir + 1); /* UNMATCHED_TUNNEL_<dir> */
+	TC_emit_error(ctx, from->x, from->y, dir + 1); /* UNMATCHED_TUNNEL_<dir> */
 }
 
 /* Mesh Phase 2 (prepare 0x3dd810+). In the binary this is an RB-tree pass that

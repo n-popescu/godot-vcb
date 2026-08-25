@@ -1,6 +1,9 @@
 /* vcb_bus.c -- see vcb_bus.h. Reasoned reconstruction of build_stage1's bus pass;
- * the texture ENCODING it feeds is exact (from the shader), the GROUPING is a
- * best-effort model (same-ink 4-connected nets) pending Phase-C validation. */
+ * the texture ENCODING it feeds is exact (from the shader), and the GROUPING is now
+ * measured against the original's own texture_buslut (tools/phasec/cmp_bus.py): on
+ * 01_32_bit_computer_compact the two partitions agree over all 10542 bus pixels
+ * except one 16-pixel net, where the original's buslut points two geometrically
+ * separate runs at the same entity-list index. */
 #include "vcb_bus.h"
 
 #include <stdlib.h>
@@ -43,21 +46,26 @@ int32_t vcb_bus_label(const TCAnalysisCtx *ctx, int32_t *out_label) {
 						continue;
 					nn = my * side + mx;
 				} else if (nink == 0x65) {
-					/* and through a TUNNEL, like a trace: scan on from the cell past
-					 * the entrance for the matching tunnel, then take the cell just
-					 * beyond it. Verified against the original, where a bus entering a
-					 * tunnel pair comes out the far side as one net while the same two
-					 * bus pixels with a plain gap between them stay separate. */
+					/* and through a TUNNEL, exactly like a trace (TC_tunnel_resolve in
+					 * vcb_pipeline.c): scan on from the cell past the entrance and take
+					 * the first tunnel whose far cell carries the SAME INK as the bus
+					 * pixel we came from. Tunnel pairs serving other wires lie between
+					 * the two ends of a long run and must be walked over -- taking the
+					 * first tunnel found instead split 64 trace nets on
+					 * 01_32_bit_computer_compact. Measured against the original: BUS_0
+					 * tunnels to BUS_0 but not to BUS_1 (probe p16). */
+					uint8_t want = cls[(size_t)cur * 2];
 					int tx = cx + 2 * DX[d], ty = cy + 2 * DY[d];
 					int found = 0;
 					while (tx >= 0 && tx < side && ty >= 0 && ty < side) {
 						if (cls[((size_t)ty * side + tx) * 2] == 0x65) {
 							int ex = tx + DX[d], ey = ty + DY[d];
-							if (ex < 0 || ex >= side || ey < 0 || ey >= side)
+							if (ex >= 0 && ex < side && ey >= 0 && ey < side &&
+									cls[((size_t)ey * side + ex) * 2] == want) {
+								nn = ey * side + ex;
+								found = 1;
 								break;
-							nn = ey * side + ex;
-							found = 1;
-							break;
+							}
 						}
 						tx += DX[d];
 						ty += DY[d];
@@ -133,50 +141,16 @@ void vcb_bus_build(const TCAnalysisCtx *ctx, const VCBModel *model, VCBBusData *
 	const int side = ctx->side;
 	const int n = side * side;
 	out->board_side = side;
-	const uint8_t *cls = (const uint8_t *)ctx->classified.begin; /* 2 bytes/pixel [ink,mark] */
 
-	/* 1. Flood-fill bus pixels into 4-connected, same-ink nets. */
+	/* 1. Flood-fill bus pixels into nets -- the SAME grouping the electrical merge
+	 *    in vcb_model.c uses (vcb_bus_label), so the rendered bus net and the net
+	 *    whose states the shader walks cannot disagree. This used to be a second,
+	 *    subtly different flood here (same-ink only, no tunnel handling), which is
+	 *    why our texture_buslut had a different net count from the original's. */
 	int32_t *net = (int32_t *)malloc((size_t)n * sizeof(int32_t));
-	int32_t *stack = (int32_t *)malloc((size_t)n * sizeof(int32_t));
-	if (!net || !stack) { free(net); free(stack); return; }
-	for (int i = 0; i < n; i++)
-		net[i] = -1;
-	static const int DX[4] = { -1, 1, 0, 0 }, DY[4] = { 0, 0, -1, 1 };
-	int nnets = 0;
-	for (int p = 0; p < n; p++) {
-		uint8_t ink = cls[(size_t)p * 2];
-		if (!bus_is_bus(ink) || net[p] != -1)
-			continue;
-		int sp = 0;
-		stack[sp++] = p;
-		net[p] = nnets;
-		while (sp) {
-			int cur = stack[--sp];
-			int cx = cur % side, cy = cur / side;
-			for (int d = 0; d < 4; d++) {
-				int nx = cx + DX[d], ny = cy + DY[d];
-				if (nx < 0 || nx >= side || ny < 0 || ny >= side)
-					continue;
-				int ni = ny * side + nx;
-				/* CROSS (0x64): a bus continues straight through a cross to the pixel
-				 * two cells along (matches the conduction-side flood in vcb_model.c and
-				 * the trace flood), keeping the rendered bus net in sync with the
-				 * electrical net across a cross. */
-				if (cls[(size_t)ni * 2] == 0x64) {
-					int mx = cx + 2 * DX[d], my = cy + 2 * DY[d];
-					if (mx < 0 || mx >= side || my < 0 || my >= side)
-						continue;
-					ni = my * side + mx;
-				}
-				if (net[ni] != -1 || cls[(size_t)ni * 2] != ink)
-					continue;
-				net[ni] = nnets;
-				stack[sp++] = ni;
-			}
-		}
-		nnets++;
-	}
-	free(stack);
+	if (!net)
+		return;
+	int nnets = (int)vcb_bus_label(ctx, net);
 	if (nnets == 0) {
 		free(net);
 		return;
