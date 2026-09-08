@@ -19,7 +19,11 @@
 #            existing boards.
 #   patch -- fixes that move the module closer to the original `vcb.exe`, and
 #            anything invisible to a board author.
+#
+# Packaging fixes bump it too, even though `modules/vcb/` itself is untouched:
+# this file is the only release trigger, so a release that ships the wrong
+# artifacts can only be corrected by moving it.
 
 major = 1
 minor = 0
-patch = 0
+patch = 1

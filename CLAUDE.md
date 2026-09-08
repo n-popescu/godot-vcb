@@ -84,10 +84,19 @@ upstream tree. See `README.vcb.md`.
 
 The one workflow that remains is `.github/workflows/release.yml`, and it is a *release*
 workflow, not a check: it fires when `vcb_version.py` changes on `master`, gates on
-`make -C modules/vcb/core/test`, builds the editor for x11/windows/osx (arm64 and
-x86_64), and publishes them as `<godot>-vcb-<vcb>` — e.g. `3.5.1-vcb-1.0.0`, the Godot
-base from `version.py` spliced onto the module version from `vcb_version.py`. So a
-branch push still tells you nothing; it is on you to run the core tests locally.
+`make -C modules/vcb/core/test`, and publishes as `<godot>-vcb-<vcb>` — e.g.
+`3.5.1-vcb-1.0.1`, the Godot base from `version.py` spliced onto the module version from
+`vcb_version.py`. So a branch push still tells you nothing; it is on you to run the core
+tests locally.
+
+It builds **two** things, and the second is easy to forget: the editor (`tools=yes`) and
+the export templates (`tools=no`, both targets, shipped as a `.tpz`). **Exporting a game
+with upstream's official templates silently produces a broken app** — the `.pck` is fine
+but the engine inside is stock Godot, which has never heard of `TransistorEngine`, so it
+dies on the first `ClassDB` lookup. The templates install under `3.5.1.stable`, the same
+directory official 3.5.1 templates use, so the two overwrite each other; use per-preset
+custom templates if that matters. `strings <exported binary> | grep TransistorEngine`
+tells you which engine an app actually contains.
 
 `vcb_version.py` lives at the repo root rather than inside `modules/vcb/` on purpose —
 that directory has to stay byte-identical to the vendored copy in `vcb-rebuild`, so it

@@ -41,9 +41,12 @@ without an engine build at all. The C++ around it is only the Godot binding.
 >
 > What replaced them is [`.github/workflows/release.yml`](.github/workflows/release.yml):
 > it does **not** run on ordinary pushes. It runs when [`vcb_version.py`](vcb_version.py)
-> changes on `master`, runs the core algorithm tests, builds the editor for Linux,
-> Windows and both macOS architectures, and publishes them under the tag
-> `<godot>-vcb-<vcb>` (e.g. `3.5.1-vcb-1.0.0`). To cut a release, bump `vcb_version.py`
+> changes on `master`, runs the core algorithm tests, builds the editor *and the export
+> templates* for Linux, Windows and both macOS architectures, and publishes them under
+> the tag `<godot>-vcb-<vcb>` (e.g. `3.5.1-vcb-1.0.1`). Use the published `.tpz` when
+> exporting a game: upstream's official templates contain stock Godot, so an app
+> exported with them has no `TransistorEngine` and dies on startup. To cut a release,
+> bump `vcb_version.py`
 > and push. To rehearse one without publishing, run the workflow manually with
 > **Dry run** checked. Everyday pushes still build nothing — use the command below.
 

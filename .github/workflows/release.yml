@@ -3,9 +3,19 @@
 # The tag is `<godot>-vcb-<vcb>` (e.g. 3.5.1-vcb-1.0.0): the Godot base from
 # `version.py`, which is pinned to upstream 3.5.1 and should not move, and the
 # module version from `vcb_version.py`, which is the one you bump. Pushing a
-# bump to `master` builds the editor for Linux, Windows and both macOS
-# architectures and publishes them; if the tag already exists the run stops
+# bump to `master` builds and publishes; if the tag already exists the run stops
 # before building, so touching `vcb_version.py` without bumping it is harmless.
+#
+# It builds two different things, and both matter:
+#
+#   editor    (tools=yes)  the binary you run vcb-rebuild with.
+#   templates (tools=no)   what the editor turns a project into an app WITH.
+#
+# The templates are the whole point of shipping a fork. Export with upstream's
+# official templates and the resulting app is stock Godot: the .pck is fine, but
+# the engine under it has never heard of TransistorEngine, so the game dies on
+# the first ClassDB lookup. Only a template built from this tree contains
+# modules/vcb.
 #
 # Note: this repo deliberately carries no other CI. Upstream Godot's workflows
 # were removed because they built stock Godot for platforms this fork does not
@@ -23,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build every platform but do not publish a release"
+        description: "Build and package everything but do not publish a release"
         type: boolean
         default: false
 
@@ -32,9 +42,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Matches the invocation documented in CLAUDE.md: the editor binary, which is
-  # what actually runs vcb-rebuild.
-  SCONSFLAGS: tools=yes target=release_debug progress=no verbose=no
+  # tools/target live in the matrix; only the universal flags belong here.
+  SCONSFLAGS: progress=no verbose=no
 
 jobs:
   version:
@@ -44,6 +53,7 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       godot: ${{ steps.resolve.outputs.godot }}
       vcb: ${{ steps.resolve.outputs.vcb }}
+      full_config: ${{ steps.resolve.outputs.full_config }}
       build: ${{ steps.resolve.outputs.build }}
       release: ${{ steps.resolve.outputs.release }}
     steps:
@@ -59,10 +69,16 @@ jobs:
           vcb=$(python3 -c 'import vcb_version as v; print(f"{v.major}.{v.minor}.{v.patch}")')
           tag="${godot}-vcb-${vcb}"
 
+          # Mirrors VERSION_FULL_CONFIG in core/version.h: the patch component is
+          # dropped when it is zero. This is the directory name the editor looks
+          # its export templates up under, so it has to match exactly.
+          full_config=$(python3 -c 'import version as v; n = f"{v.major}.{v.minor}.{v.patch}" if v.patch else f"{v.major}.{v.minor}"; print(n + "." + v.status + v.module_config)')
+
           {
             echo "godot=$godot"
             echo "vcb=$vcb"
             echo "tag=$tag"
+            echo "full_config=$full_config"
           } >> "$GITHUB_OUTPUT"
 
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
@@ -72,11 +88,11 @@ jobs:
           elif [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "build=true"    >> "$GITHUB_OUTPUT"
             echo "release=false" >> "$GITHUB_OUTPUT"
-            echo "Dry run: building \`$tag\` without publishing." >> "$GITHUB_STEP_SUMMARY"
+            echo "Dry run: building and packaging \`$tag\` without publishing." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "build=true"    >> "$GITHUB_OUTPUT"
             echo "release=true"  >> "$GITHUB_OUTPUT"
-            echo "Releasing \`$tag\` (Godot $godot + VCB $vcb)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Releasing \`$tag\` (Godot $godot + VCB $vcb, templates $full_config)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   test:
@@ -100,29 +116,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Both macOS slices build on the same arm64 image: platform/osx picks the
+        # target purely with -arch and -isysroot, so x86_64 is a plain
+        # cross-compile and no Intel runner is needed. That matters — a retired
+        # runner label does not fail, it queues for 24h, which is how the
+        # inherited upstream workflows died. Only pin labels that are known-live.
         include:
-          - name: linux-x86_64
-            runner: ubuntu-22.04
-            scons: platform=x11 bits=64
-            bin: godot.x11.opt.tools.64
-          - name: windows-x86_64
-            runner: windows-2022
-            scons: platform=windows bits=64
-            bin: godot.windows.opt.tools.64.exe
-          # Both macOS slices are built on the same arm64 image: platform/osx
-          # picks the target purely with -arch and -isysroot, so x86_64 is a
-          # plain cross-compile and no Intel runner is needed. That matters —
-          # a retired runner label does not fail, it queues for 24h, which is
-          # how the inherited upstream workflows died (see README.vcb.md).
-          # Only pin labels that are known-live.
-          - name: macos-arm64
-            runner: macos-14
-            scons: platform=osx arch=arm64
-            bin: godot.osx.opt.tools.arm64
-          - name: macos-x86_64
-            runner: macos-14
-            scons: platform=osx arch=x86_64
-            bin: godot.osx.opt.tools.x86_64
+          # The editor: tools=yes, the binary you run vcb-rebuild with.
+          - { name: editor-linux-x86_64,             os: linux,   runner: ubuntu-22.04, scons: "platform=x11 bits=64 tools=yes target=release_debug",       bin: godot.x11.opt.tools.64 }
+          - { name: editor-windows-x86_64,           os: windows, runner: windows-2022, scons: "platform=windows bits=64 tools=yes target=release_debug",   bin: godot.windows.opt.tools.64.exe }
+          - { name: editor-macos-arm64,              os: macos,   runner: macos-14,     scons: "platform=osx arch=arm64 tools=yes target=release_debug",    bin: godot.osx.opt.tools.arm64 }
+          - { name: editor-macos-x86_64,             os: macos,   runner: macos-14,     scons: "platform=osx arch=x86_64 tools=yes target=release_debug",   bin: godot.osx.opt.tools.x86_64 }
+          # Export templates: tools=no. Both targets, because target=release_debug
+          # is what "Export With Debug" uses — without it you lose stdout and the
+          # remote debugger from an exported build.
+          - { name: template-linux-x86_64-release,   os: linux,   runner: ubuntu-22.04, scons: "platform=x11 bits=64 tools=no target=release",              bin: godot.x11.opt.64 }
+          - { name: template-linux-x86_64-debug,     os: linux,   runner: ubuntu-22.04, scons: "platform=x11 bits=64 tools=no target=release_debug",        bin: godot.x11.opt.debug.64 }
+          - { name: template-windows-x86_64-release, os: windows, runner: windows-2022, scons: "platform=windows bits=64 tools=no target=release",          bin: godot.windows.opt.64.exe }
+          - { name: template-windows-x86_64-debug,   os: windows, runner: windows-2022, scons: "platform=windows bits=64 tools=no target=release_debug",    bin: godot.windows.opt.debug.64.exe }
+          - { name: template-macos-arm64-release,    os: macos,   runner: macos-14,     scons: "platform=osx arch=arm64 tools=no target=release",           bin: godot.osx.opt.arm64 }
+          - { name: template-macos-arm64-debug,      os: macos,   runner: macos-14,     scons: "platform=osx arch=arm64 tools=no target=release_debug",     bin: godot.osx.opt.debug.arm64 }
+          - { name: template-macos-x86_64-release,   os: macos,   runner: macos-14,     scons: "platform=osx arch=x86_64 tools=no target=release",          bin: godot.osx.opt.x86_64 }
+          - { name: template-macos-x86_64-debug,     os: macos,   runner: macos-14,     scons: "platform=osx arch=x86_64 tools=no target=release_debug",    bin: godot.osx.opt.debug.x86_64 }
     steps:
       - uses: actions/checkout@v4
 
@@ -134,7 +149,7 @@ jobs:
         run: python -m pip install --upgrade "scons==4.5.2"
 
       - name: Install Linux build dependencies
-        if: startsWith(matrix.name, 'linux')
+        if: matrix.os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -158,17 +173,11 @@ jobs:
           SCONS_CACHE_LIMIT: "4096"
         run: scons ${{ env.SCONSFLAGS }} ${{ matrix.scons }}
 
-      # arm64 macOS refuses to run an unsigned binary, and stripping invalidates
-      # the ad-hoc signature the linker applies — so strip first, then re-sign.
-      - name: Strip and re-sign (macOS)
-        if: startsWith(matrix.name, 'macos')
-        run: |
-          strip -x "bin/${{ matrix.bin }}"
-          codesign --force --sign - --timestamp=none "bin/${{ matrix.bin }}"
-
-      - name: Strip (Linux)
-        if: startsWith(matrix.name, 'linux')
-        run: strip "bin/${{ matrix.bin }}"
+      # No codesign here: every macOS binary is lipo'd downstream, which discards
+      # signatures anyway. The .app is signed once, assembled, in bundle-macos.
+      - name: Strip
+        if: matrix.os != 'windows'
+        run: strip ${{ matrix.os == 'macos' && '-x' || '' }} "bin/${{ matrix.bin }}"
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -188,7 +197,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: macos-*
+          pattern: editor-macos-*
           path: slices
 
       - name: Assemble Godot.app
@@ -199,8 +208,8 @@ jobs:
           # One universal binary out of the two thin slices, so a single asset
           # covers Apple silicon and Intel.
           lipo -create \
-            slices/macos-arm64/godot.osx.opt.tools.arm64 \
-            slices/macos-x86_64/godot.osx.opt.tools.x86_64 \
+            slices/editor-macos-arm64/godot.osx.opt.tools.arm64 \
+            slices/editor-macos-x86_64/godot.osx.opt.tools.x86_64 \
             -output Godot
           lipo -info Godot
 
@@ -216,8 +225,7 @@ jobs:
           # left alone: it must stay period-separated integers.
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $tag" Godot.app/Contents/Info.plist
 
-          # lipo discards the per-slice ad-hoc signatures, and arm64 macOS will
-          # not launch an unsigned binary — so sign the finished bundle.
+          # arm64 macOS will not launch an unsigned binary, and lipo left none.
           codesign --force --deep --sign - --timestamp=none Godot.app
           codesign --verify --deep --strict Godot.app
 
@@ -232,40 +240,111 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish
-    needs: [version, build, bundle-macos]
-    if: needs.version.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  templates-macos:
+    name: templates-osx
+    needs: [version, build]
+    if: needs.version.outputs.build == 'true'
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: template-macos-*
+          path: slices
+
+      - name: Assemble osx.zip
+        run: |
+          set -euo pipefail
+
+          # platform/osx/export takes ONE binary out of this zip, so each has to
+          # be universal for the exported app to be.
+          cp -R misc/dist/osx_template.app osx_template.app
+          mkdir -p osx_template.app/Contents/MacOS
+          lipo -create slices/template-macos-arm64-release/godot.osx.opt.arm64 \
+                       slices/template-macos-x86_64-release/godot.osx.opt.x86_64 \
+                       -output osx_template.app/Contents/MacOS/godot_osx_release.64
+          lipo -create slices/template-macos-arm64-debug/godot.osx.opt.debug.arm64 \
+                       slices/template-macos-x86_64-debug/godot.osx.opt.debug.x86_64 \
+                       -output osx_template.app/Contents/MacOS/godot_osx_debug.64
+          chmod +x osx_template.app/Contents/MacOS/godot_osx_*
+          lipo -info osx_template.app/Contents/MacOS/godot_osx_*
+
+          # zip, not ditto: the exporter reads this with minizip and matches
+          # entries after stripping a leading "osx_template.app/", so the bundle
+          # directory must be the zip root. Signing is pointless here — the
+          # exporter signs the app it builds out of this.
+          zip -q -9 -r osx.zip osx_template.app
+          unzip -l osx.zip | grep godot_osx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: templates-osx
+          path: osx.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package
+    needs: [version, build, bundle-macos, templates-macos]
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
           path: artifacts
 
-      - name: Package
+      - name: Build release assets
         run: |
           set -euo pipefail
           tag="${{ needs.version.outputs.tag }}"
-          mkdir -p dist
-          for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            case "$name" in
-              # Already zipped on macOS with ditto, to keep the bundle intact.
-              macos-universal) mv "$dir"/*.zip dist/ ;;
-              # Superseded by the universal .app; kept as a run artifact only.
-              macos-arm64|macos-x86_64) ;;
-              *)
-                chmod +x "$dir"/* || true
-                (cd "$dir" && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-${name}.zip" ./*)
-                ;;
-            esac
-          done
-          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          mkdir -p dist templates
+
+          # Editor binaries, one zip per desktop platform. macOS is already a
+          # ditto-made .app zip and must not be repacked.
+          (cd artifacts/editor-linux-x86_64   && chmod +x ./* && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-linux-x86_64.zip" ./*)
+          (cd artifacts/editor-windows-x86_64 && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-windows-x86_64.zip" ./*)
+          mv artifacts/macos-universal/*.zip dist/
+
+          # Export templates, under exactly the names the exporters look up:
+          # platform/x11/export sets linux_x11_64_{release,debug},
+          # platform/windows/export sets windows_64_{release,debug}.exe, and
+          # platform/osx/export asks for osx.zip.
+          cp artifacts/template-linux-x86_64-release/godot.x11.opt.64                 templates/linux_x11_64_release
+          cp artifacts/template-linux-x86_64-debug/godot.x11.opt.debug.64             templates/linux_x11_64_debug
+          cp artifacts/template-windows-x86_64-release/godot.windows.opt.64.exe       templates/windows_64_release.exe
+          cp artifacts/template-windows-x86_64-debug/godot.windows.opt.debug.64.exe   templates/windows_64_debug.exe
+          cp artifacts/templates-osx/osx.zip                                          templates/osx.zip
+          chmod +x templates/linux_x11_64_* templates/windows_64_*
+
+          # The editor installs a .tpz into <templates dir>/<version.txt>, and
+          # looks templates up under VERSION_FULL_CONFIG — so this string has to
+          # match or the install lands somewhere the exporter never checks.
+          echo "${{ needs.version.outputs.full_config }}" > templates/version.txt
+          zip -q -9 -r "dist/godot-vcb-${tag}-export-templates.tpz" templates
+
+          (cd dist && sha256sum ./*.zip ./*.tpz > SHA256SUMS.txt)
           ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish
+    needs: [version, package]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
 
       - name: Create release
         env:
@@ -276,7 +355,9 @@ jobs:
           notes=$(cat <<EOF
           Godot **${{ needs.version.outputs.godot }}** with \`modules/vcb\` **${{ needs.version.outputs.vcb }}**.
 
-          These are editor binaries (\`tools=yes target=release_debug\`). Run the game with:
+          ## Editor
+
+          \`tools=yes target=release_debug\`. Run the game with:
 
           \`\`\`bash
           ./godot.x11.opt.tools.64 --path <path-to-vcb-rebuild>
@@ -291,6 +372,25 @@ jobs:
           ./Godot.app/Contents/MacOS/Godot --path <path-to-vcb-rebuild>
           \`\`\`
 
+          ## Export templates
+
+          **Exporting with upstream's official templates produces a broken app.**
+          The \`.pck\` is fine, but the engine inside it is stock Godot and has
+          never heard of \`TransistorEngine\`, so the game fails on the first
+          \`ClassDB\` lookup. Use \`godot-vcb-${tag}-export-templates.tpz\`:
+
+          *Editor → Manage Export Templates → Install from File.*
+
+          It installs under \`${{ needs.version.outputs.full_config }}\`, which is
+          the same directory official ${{ needs.version.outputs.godot }} templates
+          use — so it replaces them. If you also export stock Godot
+          ${{ needs.version.outputs.godot }} projects, unzip the \`.tpz\` instead
+          and point each preset's **Custom Template → Release/Debug** at the files
+          inside; that keeps the two sets apart.
+
+          Verify an export with \`strings <binary> | grep TransistorEngine\` — no
+          match means the wrong template was used.
+
           Built from \`${GITHUB_SHA}\`.
           EOF
           )
@@ -298,4 +398,4 @@ jobs:
             --title "$tag" \
             --notes "$notes" \
             --target "$GITHUB_SHA" \
-            dist/*.zip dist/SHA256SUMS.txt
+            dist/*.zip dist/*.tpz dist/SHA256SUMS.txt
