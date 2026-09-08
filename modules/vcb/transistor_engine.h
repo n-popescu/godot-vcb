@@ -20,6 +20,18 @@ struct VCBSim;
 class TransistorEngine : public Reference {
 	GDCLASS(TransistorEngine, Reference);
 
+public:
+	// State-texture cell layout, registered as class constants by the original.
+	enum {
+		BYTES_WIDTH = 4,
+		OFFSET_STATE = 0,
+		OFFSET_TYPE = 1,
+		OFFSET_IN_TOTAL = 2,
+		OFFSET_IN_ACTIVE = 3,
+	};
+
+private:
+
 	Ref<TransistorCircuitModel> model;
 	Ref<ImageTexture> state_texture;
 	int random_seed = 0;
@@ -93,6 +105,12 @@ public:
 	void snapshot_clear_next();
 	void snapshot_restore_next();
 	void snapshot_restore_prev();
+	// Jump to the newest snapshot in the history in one step (the original binds this
+	// alongside restore_prev/restore_next; the game's GDScript only uses the latter
+	// two, so the name and existence are verified from the shipped engine's ClassDB
+	// while the exact stepping semantics are inferred: repeatedly advance while a
+	// next snapshot exists, which is restore_next applied to exhaustion.)
+	void snapshot_restore_most_recent();
 	bool snapshot_is_next_possible();
 	bool snapshot_is_prev_possible();
 

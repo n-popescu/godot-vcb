@@ -449,6 +449,15 @@ void TransistorEngine::snapshot_restore_prev() {
 		state_texture = te_build_state_texture(sim, state_texture, state_buf);
 	}
 }
+
+void TransistorEngine::snapshot_restore_most_recent() {
+	// Walk forward to the newest snapshot. restore_next is the single-step form;
+	// the original exposes this as the "jump to the end of the history" shortcut.
+	if (!sim)
+		return;
+	while (vcb_sim_snapshot_next_possible(sim))
+		vcb_sim_snapshot_restore_next(sim);
+}
 bool TransistorEngine::snapshot_is_next_possible() { return sim && vcb_sim_snapshot_next_possible(sim); }
 bool TransistorEngine::snapshot_is_prev_possible() { return sim && vcb_sim_snapshot_prev_possible(sim); }
 
@@ -468,6 +477,18 @@ void TransistorEngine::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("stop"), &TransistorEngine::stop);
 	ClassDB::bind_method(D_METHOD("get_texture"), &TransistorEngine::get_texture);
 	ClassDB::bind_method(D_METHOD("get_vdisplay_texture"), &TransistorEngine::get_vdisplay_texture);
+	ClassDB::bind_method(D_METHOD("snapshot_restore_most_recent"),
+			&TransistorEngine::snapshot_restore_most_recent);
+
+	// The original registers these five as class constants (verified by dumping the
+	// shipped engine's ClassDB). They describe the state texture's RGBA channels:
+	// R = state, G = ink/type, B = total in-degree, A = active (high) in-degree,
+	// 4 bytes per entity -- which is exactly the cell te_build_state_texture writes.
+	BIND_CONSTANT(BYTES_WIDTH);
+	BIND_CONSTANT(OFFSET_STATE);
+	BIND_CONSTANT(OFFSET_TYPE);
+	BIND_CONSTANT(OFFSET_IN_TOTAL);
+	BIND_CONSTANT(OFFSET_IN_ACTIVE);
 	ClassDB::bind_method(D_METHOD("get_vmem_section"), &TransistorEngine::get_vmem_section);
 	ClassDB::bind_method(D_METHOD("get_vmem_persistent", "start", "end"),
 			&TransistorEngine::get_vmem_persistent);
