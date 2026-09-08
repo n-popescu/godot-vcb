@@ -178,9 +178,63 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  bundle-macos:
+    name: macos-universal
+    needs: [version, build]
+    if: needs.version.outputs.build == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: slices
+
+      - name: Assemble Godot.app
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+
+          # One universal binary out of the two thin slices, so a single asset
+          # covers Apple silicon and Intel.
+          lipo -create \
+            slices/macos-arm64/godot.osx.opt.tools.arm64 \
+            slices/macos-x86_64/godot.osx.opt.tools.x86_64 \
+            -output Godot
+          lipo -info Godot
+
+          # misc/dist/osx_tools.app is upstream's editor bundle: Info.plist,
+          # PkgInfo, icons and the .lproj localisations, with Contents/MacOS
+          # deliberately absent — the binary is what completes it.
+          cp -R misc/dist/osx_tools.app Godot.app
+          mkdir -p Godot.app/Contents/MacOS
+          mv Godot Godot.app/Contents/MacOS/Godot
+          chmod +x Godot.app/Contents/MacOS/Godot
+
+          # So About/Finder report the fork, not plain 3.5.1. CFBundleVersion is
+          # left alone: it must stay period-separated integers.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $tag" Godot.app/Contents/Info.plist
+
+          # lipo discards the per-slice ad-hoc signatures, and arm64 macOS will
+          # not launch an unsigned binary — so sign the finished bundle.
+          codesign --force --deep --sign - --timestamp=none Godot.app
+          codesign --verify --deep --strict Godot.app
+
+          # ditto, not zip: a plain zip drops the symlinks and xattrs a bundle
+          # needs to survive the round trip.
+          ditto -c -k --keepParent Godot.app "godot-vcb-${tag}-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: godot-vcb-*-macos-universal.zip
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Publish
-    needs: [version, build]
+    needs: [version, build, bundle-macos]
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -199,8 +253,16 @@ jobs:
           mkdir -p dist
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            chmod +x "$dir"/* || true
-            (cd "$dir" && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-${name}.zip" ./*)
+            case "$name" in
+              # Already zipped on macOS with ditto, to keep the bundle intact.
+              macos-universal) mv "$dir"/*.zip dist/ ;;
+              # Superseded by the universal .app; kept as a run artifact only.
+              macos-arm64|macos-x86_64) ;;
+              *)
+                chmod +x "$dir"/* || true
+                (cd "$dir" && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-${name}.zip" ./*)
+                ;;
+            esac
           done
           (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
           ls -lh dist
@@ -220,10 +282,13 @@ jobs:
           ./godot.x11.opt.tools.64 --path <path-to-vcb-rebuild>
           \`\`\`
 
-          On macOS the download is quarantined; clear it first:
+          macOS ships as a universal \`Godot.app\` (Apple silicon + Intel). It is
+          ad-hoc signed, not notarised, so clear the quarantine flag before first
+          launch:
 
           \`\`\`bash
-          xattr -d com.apple.quarantine ./godot.osx.opt.tools.arm64
+          xattr -dr com.apple.quarantine Godot.app
+          ./Godot.app/Contents/MacOS/Godot --path <path-to-vcb-rebuild>
           \`\`\`
 
           Built from \`${GITHUB_SHA}\`.
