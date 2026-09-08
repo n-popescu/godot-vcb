@@ -349,6 +349,9 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job downloads the dist artifact and never checks out the source,
+          # so gh has no git remote to infer the repository from. Name it.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           tag="${{ needs.version.outputs.tag }}"
