@@ -1,0 +1,230 @@
+# Cuts a release whenever the VCB engine version changes.
+#
+# The tag is `<godot>-vcb-<vcb>` (e.g. 3.5.1-vcb-1.0.0): the Godot base from
+# `version.py`, which is pinned to upstream 3.5.1 and should not move, and the
+# module version from `vcb_version.py`, which is the one you bump. Pushing a
+# bump to `master` builds the editor for Linux, Windows and both macOS
+# architectures and publishes them; if the tag already exists the run stops
+# before building, so touching `vcb_version.py` without bumping it is harmless.
+#
+# Note: this repo deliberately carries no other CI. Upstream Godot's workflows
+# were removed because they built stock Godot for platforms this fork does not
+# care about (see README.vcb.md).
+
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "vcb_version.py"
+      - "version.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build every platform but do not publish a release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Matches the invocation documented in CLAUDE.md: the editor binary, which is
+  # what actually runs vcb-rebuild.
+  SCONSFLAGS: tools=yes target=release_debug progress=no verbose=no
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      godot: ${{ steps.resolve.outputs.godot }}
+      vcb: ${{ steps.resolve.outputs.vcb }}
+      build: ${{ steps.resolve.outputs.build }}
+      release: ${{ steps.resolve.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute tag and decide what to do
+        id: resolve
+        run: |
+          set -euo pipefail
+          godot=$(python3 -c 'import version as v; print(f"{v.major}.{v.minor}.{v.patch}")')
+          vcb=$(python3 -c 'import vcb_version as v; print(f"{v.major}.{v.minor}.{v.patch}")')
+          tag="${godot}-vcb-${vcb}"
+
+          {
+            echo "godot=$godot"
+            echo "vcb=$vcb"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "build=false"   >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Tag \`$tag\` already exists — nothing to do. Bump \`vcb_version.py\` to cut a new release." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "build=true"    >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Dry run: building \`$tag\` without publishing." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true"    >> "$GITHUB_OUTPUT"
+            echo "release=true"  >> "$GITHUB_OUTPUT"
+            echo "Releasing \`$tag\` (Godot $godot + VCB $vcb)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  test:
+    name: Core algorithm tests
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Godot-free core in modules/vcb/core. Seconds, and it catches far more
+      # than a full engine build does — so it gates the release.
+      - name: make -C modules/vcb/core/test
+        run: make -C modules/vcb/core/test
+
+  build:
+    name: ${{ matrix.name }}
+    needs: [version, test]
+    if: needs.version.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            scons: platform=x11 bits=64
+            bin: godot.x11.opt.tools.64
+          - name: windows-x86_64
+            runner: windows-2022
+            scons: platform=windows bits=64
+            bin: godot.windows.opt.tools.64.exe
+          - name: macos-arm64
+            runner: macos-14
+            scons: platform=osx arch=arm64
+            bin: godot.osx.opt.tools.arm64
+          - name: macos-x86_64
+            runner: macos-13
+            scons: platform=osx arch=x86_64
+            bin: godot.osx.opt.tools.x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install SCons
+        run: python -m pip install --upgrade "scons==4.5.2"
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.name, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libx11-dev libxcursor-dev libxinerama-dev libxi-dev libxrandr-dev \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libasound2-dev libpulse-dev libudev-dev
+
+      - name: Restore SCons cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.scons-cache
+          key: scons-${{ matrix.name }}-${{ needs.version.outputs.tag }}-${{ github.sha }}
+          restore-keys: |
+            scons-${{ matrix.name }}-${{ needs.version.outputs.tag }}-
+            scons-${{ matrix.name }}-
+
+      - name: Build
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache
+          SCONS_CACHE_LIMIT: "4096"
+        run: scons ${{ env.SCONSFLAGS }} ${{ matrix.scons }}
+
+      # arm64 macOS refuses to run an unsigned binary, and stripping invalidates
+      # the ad-hoc signature the linker applies — so strip first, then re-sign.
+      - name: Strip and re-sign (macOS)
+        if: startsWith(matrix.name, 'macos')
+        run: |
+          strip -x "bin/${{ matrix.bin }}"
+          codesign --force --sign - --timestamp=none "bin/${{ matrix.bin }}"
+
+      - name: Strip (Linux)
+        if: startsWith(matrix.name, 'linux')
+        run: strip "bin/${{ matrix.bin }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: bin/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish
+    needs: [version, build]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          mkdir -p dist
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            chmod +x "$dir"/* || true
+            (cd "$dir" && zip -9 -j "$GITHUB_WORKSPACE/dist/godot-vcb-${tag}-${name}.zip" ./*)
+          done
+          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.tag }}"
+          notes=$(cat <<EOF
+          Godot **${{ needs.version.outputs.godot }}** with \`modules/vcb\` **${{ needs.version.outputs.vcb }}**.
+
+          These are editor binaries (\`tools=yes target=release_debug\`). Run the game with:
+
+          \`\`\`bash
+          ./godot.x11.opt.tools.64 --path <path-to-vcb-rebuild>
+          \`\`\`
+
+          On macOS the download is quarantined; clear it first:
+
+          \`\`\`bash
+          xattr -d com.apple.quarantine ./godot.osx.opt.tools.arm64
+          \`\`\`
+
+          Built from \`${GITHUB_SHA}\`.
+          EOF
+          )
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "$notes" \
+            --target "$GITHUB_SHA" \
+            dist/*.zip dist/SHA256SUMS.txt

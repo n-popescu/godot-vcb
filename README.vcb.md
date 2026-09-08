@@ -32,13 +32,20 @@ without an engine build at all. The C++ around it is only the Godot binding.
 
 ## Build
 
-> **There is no CI here.** This fork inherited upstream Godot's eight build workflows,
-> which pin the `ubuntu-20.04` runner image GitHub has since retired — so every job
-> failed before it started, on every push, for all eight platforms. They built *stock*
-> Godot for Android/iOS/JS/server anyway, which is not what this repo is for. They are
-> removed (they are still in the history, and on the `pre-vcb-upstream-master` branch
-> together with the untouched upstream tree). Build with the command below instead; it
-> is one scons invocation and it is what the published binaries are made with.
+> **There is one workflow here, and it only cuts releases.** This fork inherited
+> upstream Godot's eight build workflows, which pin the `ubuntu-20.04` runner image
+> GitHub has since retired — so every job failed before it started, on every push, for
+> all eight platforms. They built *stock* Godot for Android/iOS/JS/server anyway, which
+> is not what this repo is for. They are removed (they are still in the history, and on
+> the `pre-vcb-upstream-master` branch together with the untouched upstream tree).
+>
+> What replaced them is [`.github/workflows/release.yml`](.github/workflows/release.yml):
+> it does **not** run on ordinary pushes. It runs when [`vcb_version.py`](vcb_version.py)
+> changes on `master`, runs the core algorithm tests, builds the editor for Linux,
+> Windows and both macOS architectures, and publishes them under the tag
+> `<godot>-vcb-<vcb>` (e.g. `3.5.1-vcb-1.0.0`). To cut a release, bump `vcb_version.py`
+> and push. To rehearse one without publishing, run the workflow manually with
+> **Dry run** checked. Everyday pushes still build nothing — use the command below.
 
 Dependencies (Debian/Ubuntu):
 

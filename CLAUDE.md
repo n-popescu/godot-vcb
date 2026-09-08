@@ -76,11 +76,22 @@ A full build is slow (tens of minutes on a few cores) and memory-hungry. If you 
 changed `modules/vcb/core/`, the unit tests in `vcb-rebuild` will tell you far more, far
 faster, than a rebuild will.
 
-**There is no CI.** The eight inherited upstream workflows pinned the retired
-`ubuntu-20.04` runner image and built *stock* Godot for platforms this repo does not
-care about, so they failed on every push and were removed. They are still in the history
-and on the `pre-vcb-upstream-master` branch, together with the untouched upstream tree.
-See `README.vcb.md`.
+**There is no CI on ordinary pushes.** The eight inherited upstream workflows pinned
+the retired `ubuntu-20.04` runner image and built *stock* Godot for platforms this repo
+does not care about, so they failed on every push and were removed. They are still in
+the history and on the `pre-vcb-upstream-master` branch, together with the untouched
+upstream tree. See `README.vcb.md`.
+
+The one workflow that remains is `.github/workflows/release.yml`, and it is a *release*
+workflow, not a check: it fires when `vcb_version.py` changes on `master`, gates on
+`make -C modules/vcb/core/test`, builds the editor for x11/windows/osx (arm64 and
+x86_64), and publishes them as `<godot>-vcb-<vcb>` — e.g. `3.5.1-vcb-1.0.0`, the Godot
+base from `version.py` spliced onto the module version from `vcb_version.py`. So a
+branch push still tells you nothing; it is on you to run the core tests locally.
+
+`vcb_version.py` lives at the repo root rather than inside `modules/vcb/` on purpose —
+that directory has to stay byte-identical to the vendored copy in `vcb-rebuild`, so it
+cannot carry a file this repo alone needs.
 
 ## Conventions
 
