@@ -109,12 +109,18 @@ jobs:
             runner: windows-2022
             scons: platform=windows bits=64
             bin: godot.windows.opt.tools.64.exe
+          # Both macOS slices are built on the same arm64 image: platform/osx
+          # picks the target purely with -arch and -isysroot, so x86_64 is a
+          # plain cross-compile and no Intel runner is needed. That matters —
+          # a retired runner label does not fail, it queues for 24h, which is
+          # how the inherited upstream workflows died (see README.vcb.md).
+          # Only pin labels that are known-live.
           - name: macos-arm64
             runner: macos-14
             scons: platform=osx arch=arm64
             bin: godot.osx.opt.tools.arm64
           - name: macos-x86_64
-            runner: macos-13
+            runner: macos-14
             scons: platform=osx arch=x86_64
             bin: godot.osx.opt.tools.x86_64
     steps:
