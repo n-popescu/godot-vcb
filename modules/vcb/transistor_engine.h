@@ -2,6 +2,8 @@
 #define TRANSISTOR_ENGINE_H
 
 #include "core/image.h"
+#include "core/os/mutex.h"
+#include "core/os/semaphore.h"
 #include "core/pool_vector.h"
 #include "core/reference.h"
 #include "scene/resources/texture.h"
@@ -72,6 +74,57 @@ private:
 	PoolVector<uint8_t> vd_px;       // reused vdisplay pixel buffer
 
 	int vdisplay_row_count() const;
+
+	// ---- the background worker -------------------------------------------------
+	// The original's solve() is ASYNCHRONOUS: it hands the compute worker a tick
+	// budget and returns the counters from BEFORE the call, and get_texture()
+	// publishes the worker's previous frame. Two consequences the game depends on,
+	// both reproduced here: solve() OVERWRITES the budget rather than adding to it
+	// (so a frame the worker could not finish is dropped, which is what makes a
+	// heavy board degrade to a lower tick rate instead of freezing the main
+	// thread), and solve(0) therefore cancels whatever was pending.
+	//
+	// The simulator itself is only ever touched by the worker. solve() publishes a
+	// request; the worker applies the overrides / virtual input and runs the ticks.
+	struct Request {
+		int64_t ticks = 0;
+		bool pending = false;  // set by solve() so a solve(0) is still a request
+		Vector<int64_t> overrides;
+		int vinput = 0;
+		int64_t vmem_range = 0;
+		double time_paused = 0.0;
+	};
+	Mutex req_mutex;              // guards `req` and the published snapshot
+	// Held by the worker for the whole of worker_apply, and by any main-thread
+	// method that touches `sim` directly (set_circuit_model, the snapshot restores),
+	// so those cannot run while the worker is mid-batch.
+	Mutex sim_mutex;
+	Semaphore req_sem;            // wakes the worker when a request lands
+	Request req;
+	bool worker_running = false;  // set by compute(), cleared by stop()
+	bool worker_exit = false;
+
+	// Published by the worker, read by the main thread. `pub_state` is the state
+	// texture's bytes for the last COMPLETED frame -- get_texture() uploads it, so
+	// the one-frame lag matches the original's.
+	// Two frames: the worker writes `pub_state`, and get_texture() hands out
+	// `pub_state_prev` -- the worker's PREVIOUS completed frame, which is what the
+	// original publishes (the one-frame lag the comparators call `shift`).
+	PoolVector<uint8_t> pub_state;
+	PoolVector<uint8_t> pub_state_prev;
+	bool pub_state_dirty = false;
+	bool pub_prev_valid = false;
+	int pub_side = 0;
+	int64_t pub_tick = 0, pub_event = 0;
+	int64_t pub_prev_tick = 0, pub_prev_event = 0;
+	int32_t pub_vmem_address = 0;
+	bool pub_vmem_ready = true;
+	Array pub_breakpoints, pub_occ_addr, pub_occ_content;
+
+	// All three run on the worker thread.
+	void worker_prepare(const Request &r); // VMem window, TIMER clock, overrides, vinput
+	void worker_run(int64_t n);            // advance at most n ticks
+	void worker_publish();                 // hand the finished frame to the main thread
 
 protected:
 	static void _bind_methods();

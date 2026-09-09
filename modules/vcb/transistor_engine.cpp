@@ -33,6 +33,7 @@ static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> r
 		PoolVector<uint8_t> &buf);
 
 void TransistorEngine::set_circuit_model(const Ref<TransistorCircuitModel> &p_model) {
+	MutexLock sim_lock(sim_mutex);
 	model = p_model;
 	if (sim) {
 		vcb_sim_free(sim);
@@ -105,8 +106,10 @@ void TransistorEngine::set_vdisplay_settings(const Vector2 &p_size, int p_index,
 // side*side*4 alloc/free each frame -- that is up to megabytes per frame on large
 // boards), and the fill is one linear pass over the entities: every value it needs
 // is already maintained by the kernel, so there is no per-frame rescan of the graph.
-static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> reuse,
-		PoolVector<uint8_t> &buf) {
+// CPU half of the state texture: fills `buf` with the {state, ink, n_conn, n_high}
+// cell for every entity. Runs on the compute worker, so it must not touch any GPU
+// resource -- te_upload_state_texture() does that on the main thread.
+static void te_fill_state_bytes(VCBSim *sim, PoolVector<uint8_t> &buf) {
 	VCBModel *m = sim->model;
 	int side = m->sidelength > 0 ? m->sidelength : 1;
 	const int need = side * side * 4;
@@ -128,6 +131,11 @@ static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> r
 			p[k * 4 + 3] = sim->n_high[r];   // n_high accumulator, unclamped
 		}
 	}
+}
+
+// GPU half: upload `buf` into the reusable ImageTexture. Main thread only.
+static Ref<ImageTexture> te_upload_state_texture(int side, const PoolVector<uint8_t> &buf,
+		Ref<ImageTexture> reuse) {
 	Ref<Image> img;
 	img.instance();
 	img->create(side, side, false, Image::FORMAT_RGBA8, buf);
@@ -144,15 +152,38 @@ static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> r
 	return tex;
 }
 
-Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p_vinput,
-		int64_t p_vmem_range, real_t p_time_paused) {
-	prev_tick = current_tick;
-	prev_event = current_event;
+// ---------------------------------------------------------------------------
+// The asynchronous solve()/compute() pair.
+//
+// The original engine does NOT tick inside solve(). solve() hands the compute
+// worker a tick budget and returns the counters as they stood BEFORE the call;
+// get_texture() publishes the worker's previous completed frame. Two behaviours
+// the game depends on follow from that, and both are reproduced here:
+//
+//   * solve() OVERWRITES the pending budget instead of adding to it, so a frame
+//     the worker could not finish is simply dropped. That is what makes a heavy
+//     board settle at a lower tick rate instead of stalling the main thread --
+//     measured on the shipped engine, which delivers ~16k of a requested 200k
+//     ticks per call and varies run to run.
+//   * solve(0) therefore CANCELS whatever was pending (tools/phasec's harness
+//     documents this: polling with solve(0) deadlocks the original).
+//
+// The simulator is touched only by the worker. solve() publishes a request and
+// returns; worker_apply() applies the overrides / virtual input and runs the
+// ticks. If no worker was ever started (Thread.start(TE, "compute", null)), the
+// request is applied inline so a standalone caller still works exactly as before.
+// ---------------------------------------------------------------------------
+
+// Apply a new request: the VMem window, the wall-clock the real-time TIMER needs,
+// the mouse overrides and the virtual input. Runs on the worker, under sim_mutex.
+void TransistorEngine::worker_prepare(const Request &r) {
+
+	MutexLock sim_lock(sim_mutex);
 
 	// The VMem editor's visible window, packed as address | (count << 32)
 	// (vmem_editor.gd::update_range); get_vmem_section() reports that slice.
-	vmem_window_start = p_vmem_range & 0xffffffff;
-	vmem_window_count = (p_vmem_range >> 32) & 0xffffffff;
+	vmem_window_start = r.vmem_range & 0xffffffff;
+	vmem_window_count = (r.vmem_range >> 32) & 0xffffffff;
 
 	// The TIMER ink is real-time in the original engine, not tick-based: the kernel
 	// compares wall-clock microseconds since the last fire against the interval,
@@ -163,10 +194,11 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 		const int64_t elapsed_us = last_solve_usec ? (int64_t)(now_us - last_solve_usec) : 0;
 		last_solve_usec = now_us;
 		if (sim)
-			vcb_sim_add_time_us(sim, elapsed_us, (int64_t)(p_time_paused * 1000000.0));
+			vcb_sim_add_time_us(sim, elapsed_us, (int64_t)(r.time_paused * 1000000.0));
 	}
 
 	Array breakpoints; // result[6]: entity-LUT positions of breakpoints that fired
+	bool state_dirty = false;
 
 	if (sim) {
 		VCBModel *m = sim->model;
@@ -184,10 +216,10 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 		// from texture_die (simulator.gd::set_mouse_override); entity index is
 		// y*sidelength + x. Only interactive inks (latches / VMEM cells) are
 		// overridable; the state is held by the simulator.
-		if (p_override_keys.size() > 0)
+		if (r.overrides.size() > 0)
 			board_changed = true; // a user interaction touched the board
-		for (int i = 0; i < p_override_keys.size(); i++) {
-			int64_t key = (int64_t)p_override_keys[i];
+		for (int i = 0; i < r.overrides.size(); i++) {
+			int64_t key = (int64_t)r.overrides[i];
 			int32_t ex = (int32_t)(key >> 32);
 			int32_t ey = (int32_t)((key >> 8) & 0xffffff);
 			uint8_t st = (uint8_t)(key & 1);
@@ -202,13 +234,13 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 		}
 
 		// Virtual input: drive the VINPUT entities (indices recorded by the
-		// compiler in vinput_indices) from the bits of p_vinput.
+		// compiler in vinput_indices) from the bits of r.vinput.
 		if (model.is_valid() && model->vinput_indices.size() > 0) {
-			if (p_vinput != last_vinput)
+			if (r.vinput != last_vinput)
 				board_changed = true; // the input word changed
 			PoolVector<int>::Read vi = model->vinput_indices.read();
 			int n = model->vinput_indices.size();
-			uint32_t v = (uint32_t)p_vinput;
+			uint32_t v = (uint32_t)r.vinput;
 			for (int i = 0; i < n && i < 32; i++) {
 				int idx = vi[i];
 				if (idx > 0 && idx <= m->n_entities) {
@@ -217,67 +249,250 @@ Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p
 				}
 			}
 		}
-		last_vinput = p_vinput;
+		last_vinput = r.vinput;
 
-		if (p_ticks > 0) {
-			int64_t e0 = sim->events;
-			vcb_sim_run(sim, p_ticks);
-			current_tick += p_ticks;
-			current_event += sim->events - e0;
-			board_changed = true; // any tick can change state (incl. CLOCK/TIMER/VMem)
-		}
-		if (board_changed) {
-			state_texture = te_build_state_texture(sim, state_texture, state_buf);
-		}
+	}
+}
 
-		// Report breakpoints that fired this frame as their entity-LUT positions
-		// (the same simlist coordinates the game uses elsewhere: x = idx %
-		// sidelength, y = idx / sidelength).
-		for (int32_t i = 0; i < sim->fired_breakpoints.count; i++) {
-			int32_t idx = sim->fired_breakpoints.items[i];
-			breakpoints.push_back(Vector2(idx % side, idx / side));
+// Advance the simulation by at most `n` ticks. Split out so the worker can run a
+// long budget in chunks and publish between them: the original's worker reports
+// progress continuously (it delivers roughly 16k ticks per 5 ms on a mid-size
+// board and a later solve() overwrites whatever is LEFT), so running a whole
+// 200k-tick budget atomically before publishing would report no progress at all.
+void TransistorEngine::worker_run(int64_t n) {
+	MutexLock sim_lock(sim_mutex);
+	if (!sim || n <= 0)
+		return;
+	int64_t e0 = sim->events;
+	vcb_sim_run(sim, (int)n);
+	current_tick += n;
+	current_event += sim->events - e0;
+	te_fill_state_bytes(sim, state_buf);
+}
+
+// Publish the frame the main thread reads: counters, VMem telemetry, breakpoints
+// and the state-texture bytes.
+void TransistorEngine::worker_publish() {
+	Array breakpoints;
+	{
+		MutexLock sim_lock(sim_mutex);
+		if (sim && sim->model) {
+			const int side = sim->model->sidelength > 0 ? sim->model->sidelength : 1;
+			for (int32_t i = 0; i < sim->fired_breakpoints.count; i++) {
+				int32_t idx = sim->fired_breakpoints.items[i];
+				breakpoints.push_back(Vector2(idx % side, idx / side));
+			}
 		}
+	}
+	bool state_dirty = true;
+	// Publish this frame for the main thread: counters, the VMem telemetry, and the
+	// state-texture bytes. get_texture() uploads `pub_state`, which is why it shows
+	// the worker's PREVIOUS frame whenever the worker has not finished this one.
+	{
+		MutexLock lock(req_mutex);
+		pub_prev_tick = pub_tick;
+		pub_prev_event = pub_event;
+		pub_tick = current_tick;
+		pub_event = current_event;
+		pub_vmem_address = sim ? sim->vmem_address : 0;
+		pub_vmem_ready = sim ? (sim->vmem_lock == 0) : true;
+		pub_breakpoints = breakpoints;
+		pub_occ_addr.clear();
+		pub_occ_content.clear();
+		if (sim) {
+			for (int32_t i = 0; i < sim->vmem_occ_addr.count; i++)
+				pub_occ_addr.push_back(sim->vmem_occ_addr.items[i]);
+			for (int32_t i = 0; i < sim->vmem_occ_content.count; i++)
+				pub_occ_content.push_back(sim->vmem_occ_content.items[i]);
+		}
+		if (state_dirty) {
+			// the frame we published last time becomes the one get_texture() serves
+			if (pub_state_dirty) {
+				pub_state_prev = pub_state;
+				pub_prev_valid = true;
+			}
+			pub_state = state_buf;
+			pub_side = sim && sim->model && sim->model->sidelength > 0
+					? sim->model->sidelength : 1;
+			pub_state_dirty = true;
+		}
+	}
+}
+
+// Main-thread convenience: fill + upload in one go. Used by the paths that touch
+// the simulator directly (set_circuit_model, snapshot restore), which hold
+// sim_mutex so they cannot run while the worker is mid-batch.
+static Ref<ImageTexture> te_build_state_texture(VCBSim *sim, Ref<ImageTexture> reuse,
+		PoolVector<uint8_t> &buf) {
+	te_fill_state_bytes(sim, buf);
+	const int side = (sim && sim->model && sim->model->sidelength > 0)
+			? sim->model->sidelength : 1;
+	return te_upload_state_texture(side, buf, reuse);
+}
+
+Variant TransistorEngine::solve(int p_ticks, const Array &p_override_keys, int p_vinput,
+		int64_t p_vmem_range, real_t p_time_paused) {
+	Request r;
+	r.ticks = p_ticks;
+	r.vinput = p_vinput;
+	r.vmem_range = p_vmem_range;
+	r.time_paused = (double)p_time_paused;
+	r.overrides.resize(p_override_keys.size());
+	for (int i = 0; i < p_override_keys.size(); i++)
+		r.overrides.write[i] = (int64_t)p_override_keys[i];
+
+	// The result must be the counters as they stood BEFORE this call. Snapshot them
+	// in the SAME critical section that hands over the request -- reading them after
+	// posting the semaphore is a race the worker can win, which reports this frame's
+	// numbers a frame early.
+	int64_t s_tick, s_event, s_ptick, s_pevent;
+	int32_t s_addr;
+	bool s_ready, threaded;
+	Array s_bp, s_occa, s_occc;
+	{
+		MutexLock lock(req_mutex);
+		threaded = worker_running;
+		if (threaded) {
+			req = r;          // OVERWRITE: an unfinished budget is dropped, not queued
+			req.pending = true;
+			s_tick = pub_tick;
+			s_event = pub_event;
+			s_ptick = pub_prev_tick;
+			s_pevent = pub_prev_event;
+			s_addr = pub_vmem_address;
+			s_ready = pub_vmem_ready;
+			s_bp = pub_breakpoints;
+			s_occa = pub_occ_addr;
+			s_occc = pub_occ_content;
+		}
+	}
+	if (threaded) {
+		req_sem.post();
+	} else {
+		// No worker is running yet -- Thread.start() has returned but the OS has not
+		// scheduled compute() (or nobody started one at all). Run inline, but still
+		// report the counters from BEFORE the call, so solve()'s contract does not
+		// depend on thread scheduling. Reporting post-call numbers here is what made
+		// SOLVE0 differ between runs.
+		{
+			MutexLock lock(req_mutex);
+			s_tick = pub_tick;
+			s_event = pub_event;
+			s_ptick = pub_prev_tick;
+			s_pevent = pub_prev_event;
+			s_addr = pub_vmem_address;
+			s_ready = pub_vmem_ready;
+			s_bp = pub_breakpoints;
+			s_occa = pub_occ_addr;
+			s_occc = pub_occ_content;
+		}
+		prev_tick = current_tick;
+		prev_event = current_event;
+		worker_prepare(r);
+		worker_run(r.ticks);
+		worker_publish();
 	}
 
 	// TE_RESULT (simulator.gd): [tick, tpf, event, epf, vmem_addr, vmem_ready,
 	// breakpoints, vmem_occ_addr, vmem_occ_content].
-	Array occ_addr, occ_content;
-	if (sim) {
-		for (int32_t i = 0; i < sim->vmem_occ_addr.count; i++)
-			occ_addr.push_back(sim->vmem_occ_addr.items[i]);
-		for (int32_t i = 0; i < sim->vmem_occ_content.count; i++)
-			occ_content.push_back(sim->vmem_occ_content.items[i]);
-	}
 	Array res;
 	res.resize(9);
-	res[0] = current_tick;
-	res[1] = current_tick - prev_tick;
-	res[2] = current_event;
-	res[3] = current_event - prev_event;
-	res[4] = sim ? sim->vmem_address : 0; // VMEM_ADDRESS (kernel VMem sweep)
-	// "ready" is the inverse of the kernel's VMem lock: the tick after an address
-	// change the memory is busy and latch schedules are recorded as occurrences
-	// instead of latching. Verified against the original, which reports ready=false
-	// on exactly the address-change ticks (tools/phasec probe p13).
-	res[5] = sim ? (sim->vmem_lock == 0) : true;
-	res[6] = breakpoints;    // breakpoint positions that fired this frame
-	res[7] = occ_addr;       // VMEM address-latch occurrences (event-log timestamps)
-	res[8] = occ_content;    // VMEM content-latch occurrences
+	res[0] = s_tick;
+	res[1] = s_tick - s_ptick;
+	res[2] = s_event;
+	res[3] = s_event - s_pevent;
+	res[4] = s_addr;
+	res[5] = s_ready;
+	res[6] = s_bp;
+	res[7] = s_occa;
+	res[8] = s_occc;
 	return res;
 }
 
-void TransistorEngine::stop() {}
+void TransistorEngine::stop() {
+	// simulator.gd calls stop() then thread.wait_to_finish(). Wake the worker with
+	// the exit flag set so its loop returns instead of blocking on the semaphore.
+	{
+		MutexLock lock(req_mutex);
+		if (!worker_running)
+			return;
+		worker_exit = true;
+	}
+	req_sem.post();
+}
 
-// Background worker the game starts with Thread.start(TE, "compute", null)
-// (simulator.gd, right after set_circuit_model). In the original engine this is
-// the continuous simulation kernel run off the main thread; in this
-// reconstruction the tick advance is driven synchronously by solve() each physics
-// frame, so this is a no-op that simply lets Thread.start()/wait_to_finish()
-// succeed. It must accept the userdata argument Thread.start always passes. If a
-// threaded kernel is added later, run its loop here.
-void TransistorEngine::compute(const Variant &) {}
+// The background worker the game starts with Thread.start(TE, "compute", null)
+// (simulator.gd, right after set_circuit_model). This is the original's continuous
+// simulation kernel: it blocks until solve() hands it a tick budget, runs it, and
+// publishes the frame. It must accept the userdata argument Thread.start always
+// passes, and it returns when stop() sets the exit flag.
+void TransistorEngine::compute(const Variant &) {
+	{
+		MutexLock lock(req_mutex);
+		if (worker_running)
+			return;           // only one worker
+		worker_running = true;
+		worker_exit = false;
+	}
+	// How many ticks to run between publishes. The original's worker reports
+	// progress continuously rather than only at the end of a budget, so a long
+	// budget must be visible as it is consumed; this is the granularity of that.
+	const int64_t CHUNK = 1024;
+	int64_t remaining = 0;
+	for (;;) {
+		if (remaining <= 0)
+			req_sem.wait();   // nothing to do: block until a request lands
+		Request r;
+		bool have_new = false;
+		{
+			MutexLock lock(req_mutex);
+			if (worker_exit)
+				break;
+			if (req.ticks != 0 || req.pending) {
+				r = req;
+				req.ticks = 0;
+				req.pending = false;
+				have_new = true;
+			}
+		}
+		if (have_new) {
+			// A new request OVERWRITES whatever is left of the previous budget --
+			// the frame the worker could not finish is dropped, not queued.
+			worker_prepare(r);
+			remaining = r.ticks;
+			if (remaining <= 0)
+				worker_publish(); // a solve(0) still publishes a frame
+		}
+		if (remaining > 0) {
+			const int64_t n = remaining < CHUNK ? remaining : CHUNK;
+			worker_run(n);
+			remaining -= n;
+			worker_publish();
+		}
+	}
+	MutexLock lock(req_mutex);
+	worker_running = false;
+	worker_exit = false;
+}
 
-Ref<Texture> TransistorEngine::get_texture() { return state_texture; }
+Ref<Texture> TransistorEngine::get_texture() {
+	// Publishes the worker's last COMPLETED frame -- if the worker is still chewing
+	// through this frame's budget, that is the previous one, which is exactly the
+	// one-frame lag the original has (tools/phasec comparators call it `shift`).
+	PoolVector<uint8_t> buf;
+	int side = 0;
+	{
+		MutexLock lock(req_mutex);
+		if (pub_prev_valid) {
+			buf = pub_state_prev;
+			side = pub_side;
+			pub_prev_valid = false;
+		}
+	}
+	if (side > 0)
+		state_texture = te_upload_state_texture(side, buf, state_texture);
+	return state_texture;
+}
 
 // Number of VMem words the display reads per frame:
 // row_count = (w*h) / (word_size/color_depth) + 1 (set_vdisplay_settings, 0x28e8d0).
@@ -426,24 +641,29 @@ bool TransistorEngine::is_entity_latch(int p_x, int p_y) {
 // Snapshot history (step back/forward) delegates to the simulator's state stack.
 // Restores rebuild the state texture so the display reflects the stepped-to state.
 void TransistorEngine::snapshot_take() {
+	MutexLock sim_lock(sim_mutex);
 	if (sim)
 		vcb_sim_snapshot_take(sim);
 }
 void TransistorEngine::snapshot_clear_all() {
+	MutexLock sim_lock(sim_mutex);
 	if (sim)
 		vcb_sim_snapshot_clear_all(sim);
 }
 void TransistorEngine::snapshot_clear_next() {
+	MutexLock sim_lock(sim_mutex);
 	if (sim)
 		vcb_sim_snapshot_clear_next(sim);
 }
 void TransistorEngine::snapshot_restore_next() {
+	MutexLock sim_lock(sim_mutex);
 	if (sim) {
 		vcb_sim_snapshot_restore_next(sim);
 		state_texture = te_build_state_texture(sim, state_texture, state_buf);
 	}
 }
 void TransistorEngine::snapshot_restore_prev() {
+	MutexLock sim_lock(sim_mutex);
 	if (sim) {
 		vcb_sim_snapshot_restore_prev(sim);
 		state_texture = te_build_state_texture(sim, state_texture, state_buf);
@@ -451,6 +671,7 @@ void TransistorEngine::snapshot_restore_prev() {
 }
 
 void TransistorEngine::snapshot_restore_most_recent() {
+	MutexLock sim_lock(sim_mutex);
 	// Walk forward to the newest snapshot. restore_next is the single-step form;
 	// the original exposes this as the "jump to the end of the history" shortcut.
 	if (!sim)

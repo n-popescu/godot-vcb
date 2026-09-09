@@ -342,7 +342,10 @@ void TransistorCompiler::compute(const Variant &) {
 	stats.clear();
 	{
 		Array cells_group, entities_group;
-		for (int s = 1; s < 256; s++) {
+		// Category 0 counts too: the original's first cells bucket is [0, N], the
+		// board's un-inked pixels plus FILLER (whose STATSTYPE is 0, unlike
+		// BACKGROUND/DECORATION). Starting at 1 dropped that bucket entirely.
+		for (int s = 0; s < 256; s++) {
 			if (ctx.stats[s] > 0) {
 				Array e;
 				e.push_back(s);
@@ -350,7 +353,7 @@ void TransistorCompiler::compute(const Variant &) {
 				cells_group.push_back(e);
 			}
 		}
-		for (int s = 1; s < 256; s++) {
+		for (int s = 0; s < 256; s++) {
 			if (ctx.entity_stats[s] > 0) {
 				Array e;
 				e.push_back(s);
